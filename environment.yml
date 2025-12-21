@@ -1,0 +1,13 @@
+name: tello-hunt
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - opencv-python
+    - av
+    - ultralytics
+    - keyboard
+
