@@ -1,7 +1,7 @@
 import time
 import cv2
 from ultralytics import YOLO
-from tello_base import Tello
+from djitellopy import Tello
 
 def clamp(x, lo, hi):
     return max(lo, min(hi, int(x)))
@@ -26,8 +26,10 @@ UD_GAIN  = 20    # keep small or set to 0 to disable vertical motion
 # Person safety
 PERSON_TOO_CLOSE_AREA_FRAC = 0.06
 
+STREAM_URL = "udp://0.0.0.0:11111"
+
 def main():
-    t = Tello()
+    tello = Tello()
     airborne = False
 
     model = YOLO("yolov8n.pt")  # fast; you can move to yolov8s.pt later
@@ -35,20 +37,37 @@ def main():
     person_class = "person"
 
     try:
-        print("SDK:", t.enter_sdk())
+        print("Connecting...")
+        tello.connect()
+        print("Battery:", tello.get_battery())
 
-        # Stream on (fire and forget)
-        t.send_no_wait("streamon")
-        time.sleep(1.0)
+        # Stream on
+        try:
+            tello.streamoff()
+        except Exception:
+            pass
+        tello.streamon()
+        time.sleep(2.0)
 
-        cap = cv2.VideoCapture("udp://0.0.0.0:11111", cv2.CAP_FFMPEG)
+        cap = cv2.VideoCapture(STREAM_URL, cv2.CAP_FFMPEG)
         if not cap.isOpened():
-            raise RuntimeError("Could not open video stream (udp://0.0.0.0:11111).")
+            raise RuntimeError(f"Could not open video stream ({STREAM_URL}).")
+
+        # Wait for first frame
+        t0 = time.time()
+        while time.time() - t0 < 10.0:
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                print("Got first frame!")
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("Failed to grab first frame within 10s")
 
         print("Window controls:")
         print("  T = takeoff (arm)")
         print("  Q = land + quit")
-        print("  H = hover (rc 0 0 0 0)")
+        print("  H = hover")
 
         # Require explicit takeoff key for safety
         while True:
@@ -63,13 +82,12 @@ def main():
                 break
 
         print("Takeoff...")
-        t.send_no_wait("takeoff")
-        time.sleep(3.0)
+        tello.takeoff()
+        time.sleep(1.0)
         airborne = True
-        t.send_no_wait("rc 0 0 0 0")
+        tello.send_rc_control(0, 0, 0, 0)
 
         last_seen_cat = 0.0
-        last_cmd_time = 0.0
 
         while True:
             ok, frame = cap.read()
@@ -115,7 +133,7 @@ def main():
                 print("Quit requested")
                 break
             if key in (ord("h"), ord("H")):
-                t.send_no_wait("rc 0 0 0 0")
+                tello.send_rc_control(0, 0, 0, 0)
 
             # 1) PERSON OVERRIDE: stop/back away if any person appears
             if best_person is not None:
@@ -125,15 +143,14 @@ def main():
                 fb = -MAX_FB  # back away slowly but decisively
                 if area_frac > PERSON_TOO_CLOSE_AREA_FRAC:
                     fb = -MAX_FB  # keep max backoff
-                t.send_no_wait(f"rc 0 {fb} 0 {yaw}")
-                last_cmd_time = time.time()
+                tello.send_rc_control(0, fb, 0, yaw)
 
                 x1, y1, x2, y2 = map(int, bb)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0,0,255), 2)
                 cv2.putText(frame, f"AVOID PERSON {conf:.2f}", (x1, max(20, y1-10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
 
-            # 2) CAT TRACKING: shadow, don’t chase
+            # 2) CAT TRACKING: shadow, don't chase
             elif best_cat is not None:
                 label, conf, cx, cy, area_frac, bb = best_cat
                 last_seen_cat = time.time()
@@ -162,15 +179,14 @@ def main():
                 if fb > 0:
                     yaw = clamp(yaw, -15, 15)
 
-                t.send_no_wait(f"rc 0 {fb} {ud} {yaw}")
-                last_cmd_time = time.time()
+                tello.send_rc_control(0, fb, ud, yaw)
 
                 x1, y1, x2, y2 = map(int, bb)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
                 cv2.putText(frame, f"CAT {conf:.2f} area={area_frac:.3f}", (x1, max(20, y1-10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
 
-                # Draw “too close” warning
+                # Draw "too close" warning
                 if area_frac >= CAT_TOO_CLOSE_AREA_FRAC:
                     cv2.putText(frame, "TOO CLOSE: BACKING OFF", (20, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
@@ -179,27 +195,31 @@ def main():
             else:
                 # if cat lost recently, just hover and slowly yaw scan (optional)
                 if time.time() - last_seen_cat < 2.0:
-                    t.send_no_wait("rc 0 0 0 0")
+                    tello.send_rc_control(0, 0, 0, 0)
                 else:
                     # Very slow scan to reacquire (or comment out to fully hover)
-                    t.send_no_wait("rc 0 0 0 10")
-                last_cmd_time = time.time()
+                    tello.send_rc_control(0, 0, 0, 10)
 
             cv2.imshow("Cat Safe Shadow", frame)
 
         # Land on exit
-        t.safe_land()
+        tello.send_rc_control(0, 0, 0, 0)
+        tello.land()
 
     finally:
         try:
-            t.send_no_wait("rc 0 0 0 0")
-            t.send_no_wait("streamoff")
+            tello.send_rc_control(0, 0, 0, 0)
+            tello.streamoff()
         except Exception:
             pass
         try:
             if airborne:
-                t.safe_land()
-            t.close()
+                tello.land()
+            tello.end()
+        except Exception:
+            pass
+        try:
+            cap.release()
         except Exception:
             pass
         cv2.destroyAllWindows()

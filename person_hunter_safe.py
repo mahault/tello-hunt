@@ -1,9 +1,8 @@
 import os
 import time
-import av
 import cv2
 from ultralytics import YOLO
-from tello_base import Tello
+from djitellopy import Tello
 
 def clamp(x, lo, hi):
     return max(lo, min(hi, int(x)))
@@ -40,23 +39,42 @@ def main():
             f'  python -c "from ultralytics import YOLO; YOLO(\'yolov8n.pt\')"'
         )
 
-    t = Tello(verbose=True)
+    tello = Tello()
     airborne = False
 
     model = YOLO(weights_path)
     PERSON_CLASS = "person"
 
     try:
-        print("SDK:", t.enter_sdk())
+        print("Connecting...")
+        tello.connect()
+        print("Battery:", tello.get_battery())
 
         # Reset stream cleanly
-        t.send_no_wait("streamoff")
+        try:
+            tello.streamoff()
+        except Exception:
+            pass
         time.sleep(0.5)
-        t.send_no_wait("streamon")
-        time.sleep(1.0)
+        tello.streamon()
+        time.sleep(2.0)
 
-        print("Opening PyAV stream...")
-        container = av.open(STREAM_URL, format="h264", timeout=5)
+        # Open stream with OpenCV
+        print(f"Opening video at: {STREAM_URL}")
+        cap = cv2.VideoCapture(STREAM_URL, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            raise RuntimeError("Failed to open video stream")
+
+        # Wait for first frame
+        t0 = time.time()
+        while time.time() - t0 < 10.0:
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                print("Got first frame!")
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("Failed to grab first frame within 10s")
 
         print("\nARMING (console):")
         print("  Press ENTER to TAKEOFF and start demo")
@@ -66,20 +84,20 @@ def main():
             print("Quitting.")
             return
 
-        # TAKEOFF (no-wait)
+        # TAKEOFF
         print("TAKEOFF...")
-        t.send_no_wait("takeoff")
-        time.sleep(3.0)
+        tello.takeoff()
+        time.sleep(1.0)
         airborne = True
 
         # Stabilize altitude
         try:
-            t.send_expect(f"up {UP_AFTER_TAKEOFF_CM}", timeout_s=6.0, retries=2)
+            tello.move_up(UP_AFTER_TAKEOFF_CM)
         except Exception:
-            t.send_no_wait(f"up {UP_AFTER_TAKEOFF_CM}")
+            pass
         time.sleep(1.0)
 
-        t.send_no_wait("rc 0 0 0 0")
+        tello.send_rc_control(0, 0, 0, 0)
 
         phase = "search"      # search -> approach -> signal -> backoff
         search_start = time.time()
@@ -90,8 +108,11 @@ def main():
 
         print("Running. Press Q in the video window to LAND+QUIT.")
 
-        for frame in container.decode(video=0):
-            img = frame.to_ndarray(format="bgr24")
+        while True:
+            ret, img = cap.read()
+            if not ret or img is None:
+                continue
+
             h, w = img.shape[:2]
             frame_area = float(w * h)
 
@@ -138,7 +159,7 @@ def main():
                 if time.time() - search_start > SEARCH_TIMEOUT:
                     print("No person found in time. Landing.")
                     break
-                t.send_no_wait(f"rc 0 0 0 {SEARCH_YAW}")
+                tello.send_rc_control(0, 0, 0, SEARCH_YAW)
                 remaining = int(SEARCH_TIMEOUT - (time.time() - search_start))
                 cv2.putText(img, f"SEARCH yaw-only ({remaining}s)", (20, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
@@ -156,27 +177,27 @@ def main():
                     if area_frac >= PERSON_TOO_CLOSE:
                         phase = "backoff"
                         phase_t0 = time.time()
-                        t.send_no_wait(f"rc 0 {-MAX_FB} 0 0")
+                        tello.send_rc_control(0, -MAX_FB, 0, 0)
                     elif area_frac < PERSON_TARGET_AREA:
                         fb = clamp((PERSON_TARGET_AREA - area_frac) * FB_GAIN, 0, MAX_FB)
                         # extra safety: don't approach if far off-center
                         if abs(x_err) > 0.35:
                             fb = 0
-                        t.send_no_wait(f"rc 0 {fb} {MAX_UD} {yaw}")
+                        tello.send_rc_control(0, fb, MAX_UD, yaw)
                     else:
                         phase = "signal"
                         phase_t0 = time.time()
-                        t.send_no_wait("rc 0 0 0 0")
+                        tello.send_rc_control(0, 0, 0, 0)
 
                 if phase == "signal":
                     yaw_sig = 15 if int(time.time() * 2) % 2 == 0 else -15
-                    t.send_no_wait(f"rc 0 0 0 {yaw_sig}")
+                    tello.send_rc_control(0, 0, 0, yaw_sig)
                     if time.time() - phase_t0 > HOLD_TIME_SEC:
                         phase = "backoff"
                         phase_t0 = time.time()
 
                 if phase == "backoff":
-                    t.send_no_wait(f"rc 0 {-MAX_FB} 0 0")
+                    tello.send_rc_control(0, -MAX_FB, 0, 0)
                     if time.time() - phase_t0 > BACKOFF_TIME_SEC:
                         print("Backoff complete. Landing.")
                         break
@@ -187,21 +208,26 @@ def main():
                             (x1, max(20, y1 - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            cv2.imshow("Person Hunter (SAFE + SEARCH) [PyAV]", img)
+            cv2.imshow("Person Hunter (SAFE + SEARCH)", img)
 
         # exit => land
-        t.safe_land()
+        tello.send_rc_control(0, 0, 0, 0)
+        tello.land()
 
     finally:
         try:
-            t.send_no_wait("rc 0 0 0 0")
-            t.send_no_wait("streamoff")
+            tello.send_rc_control(0, 0, 0, 0)
+            tello.streamoff()
         except Exception:
             pass
         try:
             if airborne:
-                t.safe_land()
-            t.close()
+                tello.land()
+            tello.end()
+        except Exception:
+            pass
+        try:
+            cap.release()
         except Exception:
             pass
         cv2.destroyAllWindows()

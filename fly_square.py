@@ -1,47 +1,53 @@
 import time
 import keyboard
-from tello_base import Tello
+from djitellopy import Tello
 
 def main():
-    t = Tello()
+    tello = Tello()
     airborne = False
 
     try:
-        print("Entering SDK mode:", t.enter_sdk())
+        print("Connecting...")
+        tello.connect()
+        print("Battery:", tello.get_battery(), "%")
 
         print("Takeoff")
-        t.send_no_wait("takeoff")
-        time.sleep(3)
+        tello.takeoff()
+        time.sleep(1.0)
         airborne = True
 
         # Square flight
         for i in range(4):
 
-            # 🔴 KILL SWITCH CHECK (runs continuously)
+            # KILL SWITCH CHECK
             if keyboard.is_pressed("q"):
                 print("EMERGENCY LAND")
-                t.safe_land()
-                return   # exit main(), then finally{} will run
+                tello.land()
+                return
 
             print(f"Forward {i+1}")
-            t.send_expect("forward 50", timeout_s=6.0, retries=2)
-            time.sleep(1.0)
+            tello.move_forward(50)
+            time.sleep(0.5)
 
             if keyboard.is_pressed("q"):
                 print("EMERGENCY LAND")
-                t.safe_land()
+                tello.land()
                 return
 
             print(f"CW {i+1}")
-            t.send_expect("cw 90", timeout_s=6.0, retries=2)
-            time.sleep(1.0)
+            tello.rotate_clockwise(90)
+            time.sleep(0.5)
+
+        print("Square complete, landing...")
+        tello.land()
+        airborne = False
 
     finally:
         if airborne:
             print("Landing (failsafe)")
-            t.safe_land()
+            tello.land()
             time.sleep(1.0)
-        t.close()
+        tello.end()
         print("Done")
 
 if __name__ == "__main__":

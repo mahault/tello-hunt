@@ -1,42 +1,84 @@
 import time
-from tello_base import Tello
+import msvcrt
+from djitellopy import Tello
+
+def read_key_nonblocking():
+    if msvcrt.kbhit():
+        ch = msvcrt.getch()
+        try:
+            return ch.decode("utf-8", errors="ignore").lower()
+        except Exception:
+            return None
+    return None
 
 def main():
-    t = Tello(verbose=True)
+    tello = Tello()
     airborne = False
+
     try:
-        print("SDK:", t.enter_sdk())
+        print("Connecting...")
+        tello.connect()
 
-        # Optional queries (may or may not reply depending on firmware)
-        for q in ["battery?", "time?", "height?", "temp?"]:
-            try:
-                print(q, "->", t.send_expect(q, timeout_s=2.0, retries=1))
-            except Exception as e:
-                print(q, "-> (no reply)", repr(e))
-
-        print("\nPress ENTER to TAKEOFF (console). Type 'q' + ENTER to quit without takeoff.")
-        s = input().strip().lower()
-        if s == "q":
-            print("Quitting.")
+        # Safety gate
+        bat = tello.get_battery()
+        print("Battery:", bat, "%")
+        if bat < 20:
+            print("Battery too low to fly safely. Charge first.")
             return
 
-        print("TAKEOFF now (no-wait).")
-        t.send_no_wait("takeoff")
-        airborne = True
+        print("\nControls (no Enter needed):")
+        print("  T = takeoff")
+        print("  L = land immediately")
+        print("  Q = land + quit")
+        print("  E = EMERGENCY motor cut (last resort)")
+        print("  Ctrl+C = land + quit\n")
 
-        # Wait so you can visually confirm
-        for i in range(10):
-            print(f"...hovering {i+1}/10 (type 'l' + ENTER anytime to land)")
-            time.sleep(1)
+        last_print = time.time()
 
-        print("LAND now.")
-        t.safe_land()
-        time.sleep(2)
+        while True:
+            k = read_key_nonblocking()
+
+            if k == "t" and not airborne:
+                print("[CTRL] TAKEOFF")
+                tello.takeoff()
+                airborne = True
+                time.sleep(1.0)
+                tello.send_rc_control(0, 0, 0, 0)
+
+            elif k == "l":
+                print("[CTRL] LAND")
+                tello.land()
+                airborne = False
+
+            elif k == "q":
+                print("[CTRL] QUIT (land first)")
+                if airborne:
+                    tello.land()
+                break
+
+            elif k == "e":
+                print("[CTRL] EMERGENCY")
+                tello.emergency()
+                break
+
+            # periodic heartbeat
+            if time.time() - last_print > 2.0:
+                last_print = time.time()
+                try:
+                    h = tello.get_height()
+                    print("[INFO] height:", h, "cm")
+                except Exception:
+                    pass
+
+            time.sleep(0.02)
+
+    except KeyboardInterrupt:
+        print("\n[CTRL] Ctrl+C -> landing")
+        if airborne:
+            tello.land()
 
     finally:
-        if airborne:
-            t.safe_land()
-        t.close()
+        tello.end()
         print("Done.")
 
 if __name__ == "__main__":

@@ -6,17 +6,26 @@ from typing import Optional
 class Tello:
     """
     Robust minimal Tello/Tello Talent UDP SDK client for Direct Connection mode.
-    - Logging for every send/receive
-    - Retry support
-    - Failsafe landing on close()
+
+    Key changes:
+    - close() does NOT auto-land unless auto_land=True
+    - safe_land() available for flight scripts
+    - emergency() available as last resort
     """
 
-    def __init__(self, tello_ip: str = "192.168.10.1", cmd_port: int = 8889, local_port: int = 8889, verbose: bool = True):
+    def __init__(
+        self,
+        tello_ip: str = "192.168.10.1",
+        cmd_port: int = 8889,
+        local_port: int = 8889,
+        verbose: bool = True,
+        auto_land: bool = False,
+    ):
         self.tello_addr = (tello_ip, cmd_port)
         self.verbose = verbose
+        self.auto_land = auto_land
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Binding to 8889 is often most reliable on Windows
         self.sock.bind(("", local_port))
         self.sock.settimeout(0.5)
 
@@ -51,7 +60,6 @@ class Tello:
 
     def send_expect(self, cmd: str, timeout_s: float = 5.0, retries: int = 2) -> str:
         last_err: Optional[Exception] = None
-
         for attempt in range(retries + 1):
             self._last_response = None
             self._log(f"[SEND] {cmd} (attempt {attempt+1}/{retries+1})")
@@ -75,32 +83,32 @@ class Tello:
         raise last_err if last_err else TimeoutError(f"No response to '{cmd}'")
 
     def enter_sdk(self) -> str:
-        # 'command' should reply 'ok' if link is good
         return self.send_expect("command", timeout_s=3.0, retries=3)
 
     def safe_land(self):
-        """
-        Best-effort landing sequence. Does not raise.
-        """
-        self._log("[SAFE] stopping motion + landing")
+        """Best-effort landing sequence."""
+        self._log("[SAFE] stop + land")
         try:
             self.send_no_wait("rc 0 0 0 0")
             time.sleep(0.1)
             for _ in range(3):
                 self.send_no_wait("land")
-                time.sleep(0.3)
+                time.sleep(0.25)
         except Exception:
             pass
 
+    def emergency(self):
+        """Emergency motor cut (drone may drop)."""
+        self._log("[EMERGENCY] motor cut")
+        self.send_no_wait("emergency")
+
     def close(self):
-        """
-        Always attempt to land on close.
-        """
         self._running = False
-        try:
-            self.safe_land()
-        except Exception:
-            pass
+        if self.auto_land:
+            try:
+                self.safe_land()
+            except Exception:
+                pass
         try:
             self.sock.close()
         except Exception:

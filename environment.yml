@@ -7,7 +7,7 @@ dependencies:
   - pip
   - pip:
     - opencv-python
-    - av
+    - djitellopy
     - ultralytics
     - keyboard
 

@@ -22,7 +22,7 @@ conda env create -f environment.yml
 conda activate tello-hunt
 
 # Or with pip
-pip install opencv-python av ultralytics keyboard
+pip install opencv-python djitellopy ultralytics keyboard
 
 # Download YOLO weights (run once)
 python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
@@ -42,12 +42,11 @@ python cmd_debug.py
 ```
 
 This tests the SDK command interface:
-- Enters SDK mode and confirms connection
-- Queries battery level, flight time, height, and temperature
-- Prompts for optional takeoff test (press ENTER to takeoff, 'q' to skip)
-- If takeoff: hovers for 10 seconds then lands automatically
+- Connects to drone and shows battery level
+- Non-blocking keyboard controls: T=takeoff, L=land, Q=quit, E=emergency
+- Prints height telemetry every 2 seconds while running
 
-Use this to verify your drone responds to commands before testing video or running applications.
+Use this to verify your drone responds to commands before testing video.
 
 ### Step 3: Test Video Stream
 
@@ -58,7 +57,6 @@ python video_debug_pyav.py
 This tests the video stream:
 - Starts the H.264 video stream on UDP port 11111
 - Opens a window displaying live video from the drone
-- Prints heartbeat messages every 2 seconds confirming frame reception
 - Press Q in the window to quit
 
 Use this to verify video works before running tracking applications.
@@ -81,7 +79,7 @@ python cat_safe_shadow.py
 
 | Script | Purpose |
 |--------|---------|
-| `cmd_debug.py` | Test SDK commands - battery queries, basic takeoff/land |
+| `cmd_debug.py` | Test SDK commands - battery queries, takeoff/land with keyboard |
 | `video_debug_pyav.py` | Test video stream - verify H.264 decoding works |
 
 ### Applications
@@ -95,7 +93,6 @@ python cat_safe_shadow.py
 
 | Script | Description |
 |--------|-------------|
-| `tello_base.py` | Core SDK client with UDP communication and failsafe landing |
 | `fly_square.py` | Simple autonomous square flight pattern |
 | `tello_connect_wifi.py` | One-time setup to connect drone to home WiFi |
 
@@ -103,7 +100,7 @@ python cat_safe_shadow.py
 
 | Script | Start | Stop | Other |
 |--------|-------|------|-------|
-| `cmd_debug.py` | ENTER | q (before takeoff) | Auto-lands after 10s |
+| `cmd_debug.py` | T | Q | L=land, E=emergency |
 | `video_debug_pyav.py` | Auto | Q (window) | - |
 | `person_hunter_safe.py` | ENTER | Q (window) | - |
 | `cat_safe_shadow.py` | T | Q | H = hover |
@@ -114,7 +111,7 @@ python cat_safe_shadow.py
 ### Drone not responding to commands
 
 1. Verify WiFi connection to TELLO-XXXXXX
-2. Run `cmd_debug.py` - should print "SDK: ok"
+2. Run `cmd_debug.py` - should show battery percentage
 3. Check battery (won't respond if critically low)
 4. Default IP is `192.168.10.1` for direct connection mode
 

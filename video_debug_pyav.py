@@ -1,46 +1,68 @@
 import time
-import av
 import cv2
-from tello_base import Tello
+from djitellopy import Tello
 
+# OpenCV FFmpeg backend URL for Tello
 STREAM_URL = "udp://0.0.0.0:11111"
 
 def main():
-    t = Tello(verbose=True)
+    tello = Tello()
+
+    print("Connecting...")
+    tello.connect()
+    print("Battery:", tello.get_battery())
+
+    # Reset stream state
     try:
-        print("SDK:", t.enter_sdk())
+        tello.streamoff()
+    except Exception:
+        pass
 
-        # Reset stream cleanly
-        t.send_no_wait("streamoff")
-        time.sleep(0.5)
-        t.send_no_wait("streamon")
-        time.sleep(1.0)
+    print("Starting stream...")
+    tello.streamon()
+    time.sleep(2.0)
 
-        print("Opening PyAV stream...")
-        container = av.open(STREAM_URL, format="h264", timeout=5)
+    # Open stream with OpenCV (uses FFmpeg backend)
+    print(f"Opening video at: {STREAM_URL}")
+    cap = cv2.VideoCapture(STREAM_URL, cv2.CAP_FFMPEG)
 
-        print("Video OK. Press Q in the window to quit.")
-        last = time.time()
+    if not cap.isOpened():
+        print("Failed to open video stream with OpenCV")
+        tello.streamoff()
+        tello.end()
+        return
 
-        for frame in container.decode(video=0):
-            img = frame.to_ndarray(format="bgr24")
-            cv2.imshow("TT Video (PyAV)", img)
-            if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
-                break
+    print("Video window should open. Press Q to quit.")
 
-            # small heartbeat
-            if time.time() - last > 2:
-                print("...receiving video frames")
-                last = time.time()
+    # Warm-up: wait for first valid frame
+    t0 = time.time()
+    while time.time() - t0 < 10.0:
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            print("Got first frame!")
+            break
+        time.sleep(0.05)
+    else:
+        print("Failed to grab first frame within 10s.")
+        cap.release()
+        tello.streamoff()
+        tello.end()
+        return
 
-        cv2.destroyAllWindows()
+    # Display loop
+    while True:
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            cv2.imshow("Tello Stream (OpenCV)", frame)
 
-    finally:
-        try:
-            t.send_no_wait("streamoff")
-        except Exception:
-            pass
-        t.close()
+        if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
+            break
+
+    cv2.destroyAllWindows()
+    cap.release()
+    tello.streamoff()
+    tello.end()
+    print("Done.")
 
 if __name__ == "__main__":
     main()
