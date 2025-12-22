@@ -1,10 +1,40 @@
 import time
 import cv2
 import logging
+import threading
 from ultralytics import YOLO
 from djitellopy import Tello
 
 logging.getLogger("djitellopy").setLevel(logging.WARNING)  # Reduce log spam
+
+
+class FrameGrabber:
+    """Threaded frame grabber - always has the latest frame ready."""
+    def __init__(self, cap):
+        self.cap = cap
+        self.frame = None
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = threading.Thread(target=self._grab_loop, daemon=True)
+        self.thread.start()
+
+    def _grab_loop(self):
+        while self.running:
+            try:
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    with self.lock:
+                        self.frame = frame
+            except:
+                break
+
+    def get_frame(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+
+    def stop(self):
+        self.running = False
+        time.sleep(0.1)
 
 def clamp(x, lo, hi):
     return max(lo, min(hi, int(x)))
@@ -28,6 +58,8 @@ UD_GAIN  = 20    # keep small or set to 0 to disable vertical motion
 
 # Person safety
 PERSON_TOO_CLOSE_AREA_FRAC = 0.06
+
+YOLO_IMG_SIZE = 320  # smaller = faster inference
 
 STREAM_URL = "udp://0.0.0.0:11111"
 
@@ -68,22 +100,57 @@ def main():
         else:
             raise RuntimeError("Failed to grab first frame within 10s")
 
-        print("Window controls:")
-        print("  T = takeoff (arm)")
-        print("  Q = land + quit")
-        print("  H = hover")
+        # Start threaded frame grabber
+        grabber = FrameGrabber(cap)
 
-        # Require explicit takeoff key for safety
+        # Create window early
+        cv2.namedWindow("Cat Safe Shadow", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Cat Safe Shadow", 960, 720)
+
+        print("\nARMING: Press T in the video window to TAKEOFF, Q to quit")
+        print("  H = hover (during flight)")
+        print("Warming up YOLO...")
+
+        # Show video while waiting for takeoff command (run YOLO to warm up)
+        warmup_frames = 0
+        yolo_ready = False
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                continue
-            cv2.imshow("Cat Safe Shadow", frame)
+            frame = grabber.get_frame()
+            if frame is not None:
+                h, w = frame.shape[:2]
+                res = model(frame, imgsz=YOLO_IMG_SIZE, verbose=False)[0]
+                warmup_frames += 1
+                if warmup_frames == 10 and not yolo_ready:
+                    print("YOLO warmed up! Ready to fly.")
+                    yolo_ready = True
+
+                # Show detections during warmup
+                for box in res.boxes:
+                    if float(box.conf[0]) >= CONF_MIN:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        label = model.names.get(int(box.cls[0]), "")
+                        if label in ("cat", "person"):
+                            area = ((x2-x1)*(y2-y1)) / (w*h)
+                            color = (0, 255, 0) if label == "cat" else (0, 0, 255)
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                            cv2.putText(frame, f"{label} area={area:.2f}", (x1, y1-10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                status = "READY - Press T" if yolo_ready else f"Warming up YOLO ({warmup_frames}/10)..."
+                cv2.putText(frame, status, (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0) if yolo_ready else (0, 255, 255), 2)
+                cv2.imshow("Cat Safe Shadow", frame)
+
             key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), ord("Q")):
-                return
             if key in (ord("t"), ord("T")):
-                break
+                if yolo_ready:
+                    break
+                else:
+                    print("Wait for YOLO to warm up!")
+            if key in (ord("q"), ord("Q")):
+                print("Quitting.")
+                grabber.stop()
+                return
 
         print("Takeoff...")
         tello.takeoff()
@@ -91,21 +158,27 @@ def main():
         airborne = True
         tello.send_rc_control(0, 0, 0, 0)
 
-        # Create window explicitly
-        cv2.namedWindow("Cat Safe Shadow", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Cat Safe Shadow", 960, 720)
+        # Flush buffered frames after takeoff
+        print("Syncing video...")
+        for _ in range(30):
+            grabber.get_frame()
+            time.sleep(0.03)
+        print("Video synced!")
 
         last_seen_cat = 0.0
 
+        print("Running. Press Q to land+quit, H to hover.")
+        print("-" * 50)
+
         while True:
-            ok, frame = cap.read()
-            if not ok:
+            frame = grabber.get_frame()
+            if frame is None:
                 continue
 
             h, w = frame.shape[:2]
             frame_area = float(w * h)
 
-            res = model(frame, verbose=False)[0]
+            res = model(frame, imgsz=YOLO_IMG_SIZE, verbose=False)[0]
             names = model.names
 
             best_cat = None
@@ -214,6 +287,10 @@ def main():
         tello.land()
 
     finally:
+        try:
+            grabber.stop()
+        except Exception:
+            pass
         try:
             tello.send_rc_control(0, 0, 0, 0)
             tello.streamoff()
