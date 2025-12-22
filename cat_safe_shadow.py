@@ -1,7 +1,10 @@
 import time
 import cv2
+import logging
 from ultralytics import YOLO
 from djitellopy import Tello
+
+logging.getLogger("djitellopy").setLevel(logging.WARNING)  # Reduce log spam
 
 def clamp(x, lo, hi):
     return max(lo, min(hi, int(x)))
@@ -50,6 +53,7 @@ def main():
         time.sleep(2.0)
 
         cap = cv2.VideoCapture(STREAM_URL, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer delay
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video stream ({STREAM_URL}).")
 
@@ -86,6 +90,10 @@ def main():
         time.sleep(1.0)
         airborne = True
         tello.send_rc_control(0, 0, 0, 0)
+
+        # Create window explicitly
+        cv2.namedWindow("Cat Safe Shadow", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Cat Safe Shadow", 960, 720)
 
         last_seen_cat = 0.0
 
@@ -126,14 +134,6 @@ def main():
                 elif label == cat_class:
                     if (best_cat is None) or (area_frac > best_cat[4]):
                         best_cat = item
-
-            # Keyboard controls via OpenCV window
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), ord("Q")):
-                print("Quit requested")
-                break
-            if key in (ord("h"), ord("H")):
-                tello.send_rc_control(0, 0, 0, 0)
 
             # 1) PERSON OVERRIDE: stop/back away if any person appears
             if best_person is not None:
@@ -200,7 +200,14 @@ def main():
                     # Very slow scan to reacquire (or comment out to fully hover)
                     tello.send_rc_control(0, 0, 0, 10)
 
+            # Show frame and check for keyboard
             cv2.imshow("Cat Safe Shadow", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), ord("Q")):
+                print("Quit requested")
+                break
+            if key in (ord("h"), ord("H")):
+                tello.send_rc_control(0, 0, 0, 0)
 
         # Land on exit
         tello.send_rc_control(0, 0, 0, 0)
