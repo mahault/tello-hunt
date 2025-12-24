@@ -143,3 +143,19 @@ EPISTEMIC_WEIGHT = 1.0
 
 # Pragmatic value weight (goal achievement)
 PRAGMATIC_WEIGHT = 1.0
+
+# =============================================================================
+# Variational Free Energy (VFE) Parameters
+# =============================================================================
+
+# Surprisal threshold for novelty detection
+# If -log p(o) > this, observation is considered novel (new location)
+NOVELTY_SURPRISAL_THRESHOLD = 5.0
+
+# VFE threshold for triggering learning rate boost
+# High VFE = model doesn't fit well, should learn faster
+VFE_HIGH_THRESHOLD = 3.0
+
+# VFE threshold for confident localization
+# Low VFE = good model fit, confident about location
+VFE_LOW_THRESHOLD = 1.0

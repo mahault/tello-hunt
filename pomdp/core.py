@@ -130,6 +130,207 @@ def belief_update_multi_modality(
 
 
 # =============================================================================
+# Variational Free Energy (VFE) - for perception/inference
+# =============================================================================
+
+@jax.jit
+def accuracy(
+    belief: jnp.ndarray,
+    A: jnp.ndarray,
+    obs_idx: int,
+    eps: float = 1e-10
+) -> float:
+    """
+    Compute accuracy term of VFE: E_q[log p(o|s)]
+
+    How well the current belief explains the observation.
+    Higher = better fit.
+
+    Args:
+        belief: Current belief q(s), shape (n_states,)
+        A: Observation model P(o|s), shape (n_obs, n_states)
+        obs_idx: Observed observation index
+
+    Returns:
+        accuracy: E_q[log p(o|s)] (scalar, higher = better)
+    """
+    # P(o|s) for the observed o
+    likelihood = A[obs_idx, :]  # shape (n_states,)
+
+    # E_q[log p(o|s)] = sum_s q(s) * log p(o|s)
+    return jnp.sum(belief * jnp.log(likelihood + eps))
+
+
+@jax.jit
+def complexity(
+    posterior: jnp.ndarray,
+    prior: jnp.ndarray,
+    eps: float = 1e-10
+) -> float:
+    """
+    Compute complexity term of VFE: KL[q(s) || p(s)]
+
+    How much the posterior diverged from the prior.
+    Lower = simpler update (less surprise).
+
+    Args:
+        posterior: Posterior belief q(s), shape (n_states,)
+        prior: Prior belief p(s), shape (n_states,)
+
+    Returns:
+        complexity: KL divergence (scalar, lower = simpler)
+    """
+    return kl_divergence(posterior, prior, eps)
+
+
+@jax.jit
+def variational_free_energy(
+    posterior: jnp.ndarray,
+    prior: jnp.ndarray,
+    A: jnp.ndarray,
+    obs_idx: int,
+    eps: float = 1e-10
+) -> float:
+    """
+    Compute Variational Free Energy (VFE).
+
+    VFE = complexity - accuracy
+        = KL[q(s) || p(s)] - E_q[log p(o|s)]
+
+    Lower VFE = better model fit.
+    High VFE = observation doesn't fit model well (novelty/surprise).
+
+    Args:
+        posterior: Posterior belief q(s) after update, shape (n_states,)
+        prior: Prior belief p(s) before update, shape (n_states,)
+        A: Observation model P(o|s), shape (n_obs, n_states)
+        obs_idx: Observed observation index
+
+    Returns:
+        F: Variational free energy (scalar, lower = better fit)
+    """
+    acc = accuracy(posterior, A, obs_idx, eps)
+    comp = complexity(posterior, prior, eps)
+
+    return comp - acc
+
+
+@jax.jit
+def surprisal(
+    A: jnp.ndarray,
+    prior: jnp.ndarray,
+    obs_idx: int,
+    eps: float = 1e-10
+) -> float:
+    """
+    Compute surprisal (negative log evidence): -log p(o)
+
+    p(o) = sum_s p(o|s) p(s)
+
+    High surprisal = unexpected observation (novelty).
+    This is an upper bound on VFE.
+
+    Args:
+        A: Observation model P(o|s), shape (n_obs, n_states)
+        prior: Prior belief p(s), shape (n_states,)
+        obs_idx: Observed observation index
+
+    Returns:
+        surprisal: -log p(o) (scalar, higher = more surprising)
+    """
+    # P(o|s) for observed o
+    likelihood = A[obs_idx, :]  # shape (n_states,)
+
+    # P(o) = sum_s P(o|s) P(s)
+    marginal_likelihood = jnp.sum(likelihood * prior)
+
+    return -jnp.log(marginal_likelihood + eps)
+
+
+@jax.jit
+def vfe_components(
+    posterior: jnp.ndarray,
+    prior: jnp.ndarray,
+    A: jnp.ndarray,
+    obs_idx: int,
+    eps: float = 1e-10
+) -> Tuple[float, float, float, float]:
+    """
+    Compute all VFE-related quantities at once.
+
+    Returns:
+        vfe: Variational free energy
+        acc: Accuracy term (higher = better)
+        comp: Complexity term (lower = simpler)
+        surp: Surprisal (higher = more novel)
+    """
+    acc = accuracy(posterior, A, obs_idx, eps)
+    comp = complexity(posterior, prior, eps)
+    vfe = comp - acc
+    surp = surprisal(A, prior, obs_idx, eps)
+
+    return vfe, acc, comp, surp
+
+
+@jax.jit
+def is_novel_observation(
+    A: jnp.ndarray,
+    prior: jnp.ndarray,
+    obs_idx: int,
+    novelty_threshold: float = 5.0,
+    eps: float = 1e-10
+) -> bool:
+    """
+    Check if observation is novel (high surprisal).
+
+    Args:
+        A: Observation model P(o|s), shape (n_obs, n_states)
+        prior: Prior belief p(s), shape (n_states,)
+        obs_idx: Observed observation index
+        novelty_threshold: Surprisal threshold for novelty
+
+    Returns:
+        is_novel: True if observation is surprising
+    """
+    surp = surprisal(A, prior, obs_idx, eps)
+    return surp > novelty_threshold
+
+
+@jax.jit
+def belief_update_with_vfe(
+    prior: jnp.ndarray,
+    A: jnp.ndarray,
+    obs_idx: int,
+    eps: float = 1e-10
+) -> Tuple[jnp.ndarray, float, float, float, float]:
+    """
+    Perform belief update and compute VFE components.
+
+    Combines perception (belief update) with VFE monitoring.
+
+    Args:
+        prior: Prior belief p(s), shape (n_states,)
+        A: Observation model P(o|s), shape (n_obs, n_states)
+        obs_idx: Observed observation index
+
+    Returns:
+        posterior: Updated belief q(s)
+        vfe: Variational free energy
+        accuracy: Accuracy term
+        complexity: Complexity term
+        surprisal: Surprisal (-log evidence)
+    """
+    # Belief update
+    likelihood = A[obs_idx, :]
+    posterior = belief_update(prior, likelihood, eps)
+
+    # VFE components
+    vfe, acc, comp, surp = vfe_components(posterior, prior, A, obs_idx, eps)
+
+    return posterior, vfe, acc, comp, surp
+
+
+# =============================================================================
 # State Prediction
 # =============================================================================
 

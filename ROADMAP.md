@@ -176,13 +176,24 @@ while running:
 ### Phase 1: Core Infrastructure ✓
 - [x] `pomdp/config.py` - state/observation definitions, N_LOCATIONS constant
 - [x] `pomdp/core.py` - JAX JIT functions:
-  - `normalize()`, `softmax()`
-  - `belief_update()`, `belief_update_from_A()`
-  - `predict_next_belief()`, `predict_observation()`
-  - `expected_free_energy()`, `compute_all_efe()`
-  - `select_action()`
-  - `update_dirichlet_counts()`, `counts_to_distribution()`
-  - `expand_belief()`, `expand_A_matrix()`, `expand_B_matrix()`
+  - `normalize()`, `softmax()`, `entropy()`, `kl_divergence()`
+  - `belief_update()`, `belief_update_from_A()`, `belief_update_multi_modality()`
+  - **VFE functions (for perception):**
+    - `accuracy()` - E_q[log p(o|s)], how well belief explains observation
+    - `complexity()` - KL[q||p], how much belief diverged from prior
+    - `variational_free_energy()` - complexity - accuracy
+    - `surprisal()` - -log p(o), novelty detection
+    - `vfe_components()` - all VFE metrics at once
+    - `is_novel_observation()` - threshold-based novelty check
+    - `belief_update_with_vfe()` - update + VFE monitoring
+  - **EFE functions (for action):**
+    - `predict_next_belief()`, `predict_observation()`
+    - `expected_free_energy()`, `compute_all_efe()`
+    - `select_action()`
+  - **Learning:**
+    - `update_dirichlet_counts()`, `counts_to_distribution()`
+  - **Dynamic state spaces:**
+    - `expand_belief()`, `expand_A_matrix()`, `expand_B_matrix()`
 - [x] `pomdp/observation_encoder.py` - YOLO → fixed tokens
   - `ObservationToken` dataclass
   - `encode_yolo_detections()` - convert YOLO boxes to fixed-size token
