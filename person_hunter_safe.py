@@ -36,8 +36,8 @@ def clamp(x, lo, hi):
 # --------- SAFETY / TUNING ----------
 CONF_MIN = 0.45
 
-PERSON_TARGET_AREA = 0.65    # approach until person is 55% of frame (arm's distance)
-PERSON_TOO_CLOSE   = 0.75    # back off only if person is 75% of frame
+PERSON_TARGET_AREA = 0.80    # approach until person is 80% of frame (very close)
+PERSON_TOO_CLOSE   = 0.90    # back off only if person is 90% of frame
 
 YOLO_IMG_SIZE = 320          # smaller = faster inference (default 640)
 
@@ -48,12 +48,16 @@ MAX_UD  = 0
 YAW_GAIN = 35
 FB_GAIN  = 400               # approach gain
 
-SEARCH_YAW = 12
-SEARCH_TIMEOUT = 15.0
+SEARCH_YAW = 35              # faster rotation during search (was 12)
+SEARCH_TIMEOUT = 30.0        # more time to search (was 15)
 PERSON_FRAMES_TO_LOCK = 5
 
+# Physical contact detection - if commanding forward but not moving
+CONTACT_SPEED_THRESHOLD = 5   # if speed < this while commanding forward, might be blocked
+CONTACT_FRAMES_NEEDED = 5     # need this many frames of blocked movement to trigger
+
 HOLD_TIME_SEC = 2.5
-BACKOFF_TIME_SEC = 2.0
+RETURN_HOME_SPEED = 15       # speed when returning home
 UP_AFTER_TAKEOFF_CM = 40
 
 STREAM_URL = "udp://0.0.0.0:11111"
@@ -186,7 +190,7 @@ def main():
             time.sleep(0.03)
         print("Video synced!")
 
-        phase = "search"      # search -> approach -> signal -> backoff
+        phase = "search"      # search -> approach -> signal -> return_home
         search_start = time.time()
         phase_t0 = time.time()
 
@@ -194,6 +198,16 @@ def main():
         locked_person = None
         last_phase = None
         frame_count = 0
+
+        # Track movement for return-to-home
+        total_yaw_time = 0.0      # cumulative yaw (positive = clockwise)
+        total_forward_time = 0.0  # cumulative forward movement time
+        last_frame_time = time.time()
+        search_yaw_direction = 1  # 1 = clockwise, -1 = counter-clockwise
+
+        # Contact detection
+        blocked_frames = 0        # frames where we command forward but don't move
+        last_commanded_fb = 0     # last forward/back command sent
 
         print("Running. Press Q in the video window to LAND+QUIT.")
         print("-" * 50)
@@ -206,10 +220,33 @@ def main():
                 continue
 
             frame_count += 1
+            current_time = time.time()
+            dt = current_time - last_frame_time
+            last_frame_time = current_time
+
             if frame_count <= 3:
                 print(f"  [9] Processing frame {frame_count}...")
             h, w = img.shape[:2]
             frame_area = float(w * h)
+
+            # Physical contact detection - check if we're blocked
+            speed_y = 0
+            if last_commanded_fb > 5:  # if we commanded forward movement
+                try:
+                    speed_y = tello.get_speed_y()  # forward speed in Tello frame
+                    if abs(speed_y) < CONTACT_SPEED_THRESHOLD:
+                        blocked_frames += 1
+                        if blocked_frames >= CONTACT_FRAMES_NEEDED:
+                            print(f"[Frame {frame_count}] CONTACT DETECTED! Commanded fb={last_commanded_fb} but speed_y={speed_y}")
+                            tello.send_rc_control(0, -MAX_FB, 5, 0)  # back off and rise
+                            time.sleep(0.5)
+                            blocked_frames = 0
+                    else:
+                        blocked_frames = 0
+                except:
+                    pass  # ignore if speed query fails
+            else:
+                blocked_frames = 0
 
             # YOLO detect (smaller input = faster)
             res = model(img, imgsz=YOLO_IMG_SIZE, verbose=False)[0]
@@ -249,17 +286,18 @@ def main():
                 locked_person = None
 
             # Behavior
-            if locked_person is None:
+            if locked_person is None and phase == "search":
                 # SEARCH yaw-only
                 if time.time() - search_start > SEARCH_TIMEOUT:
                     print("No person found in time. Landing.")
                     break
-                tello.send_rc_control(0, 0, 0, SEARCH_YAW)
+                tello.send_rc_control(0, 0, 0, SEARCH_YAW * search_yaw_direction)
+                total_yaw_time += dt * search_yaw_direction  # track cumulative yaw
                 remaining = int(SEARCH_TIMEOUT - (time.time() - search_start))
                 cv2.putText(img, f"SEARCH yaw-only ({remaining}s)", (20, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
 
-            else:
+            elif phase in ("search", "approach", "signal"):
                 conf, cx, area_frac, bb = locked_person
                 x_err = (cx - w/2) / (w/2)
                 yaw = clamp(x_err * YAW_GAIN, -MAX_YAW, MAX_YAW)
@@ -271,43 +309,76 @@ def main():
 
                 if phase == "approach":
                     if area_frac >= PERSON_TOO_CLOSE:
-                        phase = "backoff"
+                        phase = "signal"  # skip to signal if too close
                         phase_t0 = time.time()
-                        print(f"[Frame {frame_count}] PHASE: approach -> backoff (TOO CLOSE area={area_frac:.3f} >= {PERSON_TOO_CLOSE})")
-                        tello.send_rc_control(0, -MAX_FB, 0, 0)
+                        print(f"[Frame {frame_count}] PHASE: approach -> signal (TOO CLOSE area={area_frac:.3f})")
+                        tello.send_rc_control(0, 0, 0, 0)
+                        last_commanded_fb = 0
                     elif area_frac < PERSON_TARGET_AREA:
                         fb = clamp((PERSON_TARGET_AREA - area_frac) * FB_GAIN, 0, MAX_FB)
                         # Slow down approach if far off-center (but don't stop)
                         if abs(x_err) > 0.4:
                             fb = max(5, fb // 2)
                         tello.send_rc_control(0, fb, MAX_UD, yaw)
+                        last_commanded_fb = fb  # track for contact detection
+                        # Track forward movement and yaw
+                        total_forward_time += dt * (fb / MAX_FB)  # normalized
+                        total_yaw_time += dt * (yaw / MAX_YAW)    # normalized yaw
                         # Log approach progress periodically
                         if frame_count % 30 == 0:
-                            print(f"[Frame {frame_count}] APPROACH: area={area_frac:.3f} target={PERSON_TARGET_AREA} fb={fb}")
+                            print(f"[Frame {frame_count}] APPROACH: area={area_frac:.3f} target={PERSON_TARGET_AREA} fb={fb} (fwd={total_forward_time:.1f}s)")
                     else:
                         phase = "signal"
                         phase_t0 = time.time()
                         print(f"[Frame {frame_count}] PHASE: approach -> signal (IN RANGE area={area_frac:.3f})")
                         tello.send_rc_control(0, 0, 0, 0)
+                        last_commanded_fb = 0
 
                 if phase == "signal":
                     yaw_sig = 15 if int(time.time() * 2) % 2 == 0 else -15
                     tello.send_rc_control(0, 0, 0, yaw_sig)
                     if time.time() - phase_t0 > HOLD_TIME_SEC:
-                        phase = "backoff"
+                        phase = "return_home"
                         phase_t0 = time.time()
-                        print(f"[Frame {frame_count}] PHASE: signal -> backoff (signal complete)")
+                        print(f"[Frame {frame_count}] PHASE: signal -> return_home")
+                        print(f"  Tracked: forward={total_forward_time:.1f}s, yaw={total_yaw_time:.1f}s")
+                        # Turn around first
+                        tello.send_rc_control(0, 0, 0, 0)
 
-                if phase == "backoff":
-                    tello.send_rc_control(0, -MAX_FB, 0, 0)
-                    if time.time() - phase_t0 > BACKOFF_TIME_SEC:
-                        print("Backoff complete. Landing.")
-                        break
+            # RETURN HOME PHASE - runs independently of person detection
+            if phase == "return_home":
+                elapsed = time.time() - phase_t0
 
-                # Log phase changes
-                if phase != last_phase:
-                    last_phase = phase
+                # Phase 1: Turn around (use blocking command for reliability)
+                if elapsed < 0.5:
+                    cv2.putText(img, "RETURN: Turning around...", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 165, 0), 2)
+                    cv2.imshow("Person Hunter", img)
+                    cv2.waitKey(1)
+                    if elapsed < 0.1:  # only send once
+                        print("Executing 180° turn...")
+                        tello.send_rc_control(0, 0, 0, 0)
+                        try:
+                            tello.rotate_counter_clockwise(180)
+                        except Exception as e:
+                            print(f"Rotate failed: {e}")
+                        phase_t0 = time.time()  # reset timer after turn
 
+                # Phase 2: Fly back (based on tracked forward time)
+                elif elapsed < 0.5 + total_forward_time * 1.5:  # 1.5x to ensure we get back
+                    tello.send_rc_control(0, RETURN_HOME_SPEED, 0, 0)
+                    remaining = 0.5 + total_forward_time * 1.5 - elapsed
+                    cv2.putText(img, f"RETURN: Flying back ({remaining:.1f}s)", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 165, 0), 2)
+
+                # Phase 3: Done - land (skip turning back to save time)
+                else:
+                    print("Return home complete. Landing.")
+                    break
+
+            # Draw bounding box if we have a locked person (during approach/signal)
+            if locked_person is not None and phase in ("approach", "signal"):
+                conf, cx, area_frac, bb = locked_person
                 x1, y1, x2, y2 = map(int, bb)
                 cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 2)
                 cv2.putText(img, f"{phase.upper()} conf={conf:.2f} area={area_frac:.3f}",
@@ -318,6 +389,11 @@ def main():
                 status_color = (0, 255, 0) if area_frac < PERSON_TARGET_AREA else (0, 255, 255) if area_frac < PERSON_TOO_CLOSE else (0, 0, 255)
                 cv2.putText(img, f"Target: {PERSON_TARGET_AREA:.3f} | TooClose: {PERSON_TOO_CLOSE:.3f}",
                             (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
+
+            # Show speed for contact detection debug
+            if last_commanded_fb > 5:
+                cv2.putText(img, f"Speed: {speed_y} | Blocked: {blocked_frames}/{CONTACT_FRAMES_NEEDED}",
+                            (20, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
             # Show frame and check for quit
             cv2.imshow("Person Hunter", img)
