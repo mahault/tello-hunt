@@ -437,7 +437,7 @@ def expected_free_energy(
     return G
 
 
-@jax.jit
+@partial(jax.jit, static_argnums=(4,))
 def compute_all_efe(
     belief: jnp.ndarray,
     A: jnp.ndarray,
@@ -453,7 +453,7 @@ def compute_all_efe(
         A: Observation model
         B: Transition model with action dimension
         C: Observation preferences
-        n_actions: Number of actions
+        n_actions: Number of actions (static)
 
     Returns:
         G_values: EFE for each action, shape (n_actions,)
@@ -469,7 +469,7 @@ def compute_all_efe(
 # Action Selection
 # =============================================================================
 
-@jax.jit
+@partial(jax.jit, static_argnums=(4,))
 def select_action(
     belief: jnp.ndarray,
     A: jnp.ndarray,
@@ -486,7 +486,7 @@ def select_action(
         A: Observation model
         B: Transition model
         C: Observation preferences
-        n_actions: Number of available actions
+        n_actions: Number of available actions (static)
         temperature: Softmax temperature (lower = more deterministic)
 
     Returns:

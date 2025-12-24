@@ -10,4 +10,6 @@ dependencies:
     - djitellopy
     - ultralytics
     - keyboard
+    - jax
+    - jaxlib
 
