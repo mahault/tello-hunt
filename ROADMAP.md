@@ -246,12 +246,18 @@ while running:
   - Save/load via `WorldModel.save()` and `WorldModel.load()`
   - `LocalizationResult` dataclass with VFE diagnostics
 
-### Phase 4: Human Search POMDP
-- [ ] `pomdp/human_search.py`:
-  - P(person_obs | human_loc, drone_loc)
-  - `update_human_prior_from_sighting()` - learn where humans appear
-  - `update_human_belief()` (JIT)
-  - `get_search_target()` - where to look next
+### Phase 4: Human Search POMDP ✓
+- [x] `pomdp/human_search.py`:
+  - `HumanSearchPOMDP` class - belief tracking over human locations
+  - State space: N_locations + 1 ("not visible")
+  - Dynamic A matrix: P(person_obs | human_loc, drone_loc)
+  - B matrix: Human transition model (mostly stationary)
+  - `update()` - Bayesian belief update from person observations
+  - `_update_sighting_counts()` - learn where humans appear
+  - `_get_search_target()` - recommend where to look next
+  - `expand_to_locations()` - dynamic state space expansion
+  - `HumanSearchResult` dataclass with belief diagnostics
+  - Save/load via `save_state()` and `load_state()`
 
 ### Phase 5: Interaction Mode POMDP
 - [ ] `pomdp/interaction_mode.py`:

@@ -525,6 +525,100 @@ except Exception as e:
     traceback.print_exc()
     raise
 
+# Test 13: Human Search POMDP
+print("\n[13] Testing Human Search POMDP...")
+try:
+    from pomdp.human_search import HumanSearchPOMDP, HumanSearchResult
+    from pomdp.observation_encoder import create_empty_observation
+
+    # Create human search POMDP
+    hs = HumanSearchPOMDP(n_locations=3)
+    assert hs.n_locations == 3, "Should have 3 locations"
+    assert hs.n_states == 4, "Should have 4 states (3 locs + not_visible)"
+    print(f"    Initial: n_locations={hs.n_locations}, n_states={hs.n_states}")
+
+    # Create observation with no person
+    obs_no_person = create_empty_observation()
+
+    # Update from location 0 with no person detected
+    result = hs.update(obs_no_person, drone_location=0)
+    assert not result.person_detected, "Should not detect person"
+    print(f"    No person at loc 0: belief_entropy={result.belief_entropy:.2f}")
+    print(f"    Belief: {result.belief}")
+
+    # Create observation with person detected (center)
+    obs_person = create_empty_observation()
+    obs_person.person_detected = True
+    obs_person.person_area = 0.3
+    obs_person.person_cx = 0.0
+    obs_person.person_obs_idx = 2  # detected_center
+
+    # Update from location 1 with person detected
+    result = hs.update(obs_person, drone_location=1)
+    assert result.person_detected, "Should detect person"
+    print(f"    Person detected at loc 1: most_likely={result.most_likely_location}, conf={result.confidence:.2f}")
+    print(f"    Belief after detection: {result.belief}")
+
+    # Belief should now favor location 1
+    assert result.belief[1] > 0.4, f"Should have high belief at loc 1, got {result.belief[1]}"
+
+    # Update again at same location (no person) - belief should shift toward "not visible"
+    result = hs.update(obs_no_person, drone_location=1)
+    print(f"    No person at loc 1 now: most_likely={result.most_likely_location}")
+    print(f"    Search target: {result.search_target}")
+
+    # Get statistics
+    stats = hs.get_statistics()
+    print(f"    Stats: sightings={stats['total_sightings']}, entropy={stats['belief_entropy']:.2f}")
+
+    print("    [PASS] Human Search POMDP works!")
+except Exception as e:
+    print(f"    [FAIL] {e}")
+    import traceback
+    traceback.print_exc()
+    raise
+
+# Test 14: Human Search with expanding locations
+print("\n[14] Testing Human Search location expansion...")
+try:
+    from pomdp.human_search import HumanSearchPOMDP
+
+    # Start with 1 location
+    hs = HumanSearchPOMDP(n_locations=1)
+    assert hs.n_states == 2, "Should have 2 states initially"
+
+    # Expand to 5 locations
+    hs.expand_to_locations(5)
+    assert hs.n_locations == 5, "Should have 5 locations"
+    assert hs.n_states == 6, "Should have 6 states"
+    print(f"    Expanded to 5 locations: n_states={hs.n_states}")
+    print(f"    Belief after expansion: {hs.belief}")
+
+    # Belief should still sum to 1
+    assert abs(float(hs.belief.sum()) - 1.0) < 1e-5, "Belief should sum to 1"
+
+    # Test set_belief_at_location
+    hs.set_belief_at_location(2, confidence=0.8)
+    assert hs.belief[2] > 0.7, "Should have high belief at loc 2"
+    print(f"    After set_belief_at_location(2): {hs.belief}")
+
+    # Test reset to prior
+    hs.reset_belief_to_prior()
+    print(f"    After reset_belief_to_prior: {hs.belief}")
+
+    # Test save/load
+    state = hs.save_state()
+    hs2 = HumanSearchPOMDP.load_state(state)
+    assert hs2.n_locations == hs.n_locations, "Should preserve n_locations"
+    print(f"    Save/load roundtrip: OK")
+
+    print("    [PASS] Human Search expansion works!")
+except Exception as e:
+    print(f"    [FAIL] {e}")
+    import traceback
+    traceback.print_exc()
+    raise
+
 print("\n" + "=" * 50)
 print("All tests passed!")
 print("=" * 50)

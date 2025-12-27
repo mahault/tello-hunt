@@ -29,3 +29,4 @@ from .map_persistence import (
     list_saved_maps,
 )
 from .world_model import WorldModel, LocalizationResult
+from .human_search import HumanSearchPOMDP, HumanSearchResult
