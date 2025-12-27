@@ -290,6 +290,157 @@ except Exception as e:
     print(f"    [FAIL] {e}")
     raise
 
+# Test 8: Topological Map
+print("\n[8] Testing topological map...")
+try:
+    from pomdp.topological_map import TopologicalMap, LocationNode
+    from pomdp.observation_encoder import create_empty_observation, ObservationToken
+
+    # Create mock observations for different "rooms"
+    def create_room_obs(obj_levels):
+        """Create observation with specific object levels."""
+        obs = create_empty_observation()
+        obs.object_levels = np.array(obj_levels, dtype=np.int32)
+        obs.object_max_conf = np.where(obs.object_levels > 0, 0.8, 0.0).astype(np.float32)
+        return obs
+
+    # Kitchen: oven (10), refrigerator (13), sink (12)
+    kitchen_obs = create_room_obs([0,0,0,0,0,0,0,0,0,0, 2, 0, 2, 2, 0,0,0])
+    # Living room: couch (2), tv (7)
+    living_obs = create_room_obs([0,0,2,0,0,0,0,2,0,0, 0, 0, 0, 0, 0,0,0])
+    # Bedroom: bed (4)
+    bedroom_obs = create_room_obs([0,0,0,0,2,0,0,0,0,0, 0, 0, 0, 0, 0,0,0])
+
+    # Create map and add locations
+    topo_map = TopologicalMap()
+    assert topo_map.n_locations == 0, "Should start empty"
+
+    # Localize to first observation (should create new)
+    loc_id, sim, is_new = topo_map.localize(kitchen_obs)
+    assert is_new, "First location should be new"
+    assert loc_id == 0, "First location should be id 0"
+    print(f"    Added kitchen: loc_id={loc_id}, is_new={is_new}")
+
+    # Localize to second observation (should create new)
+    loc_id, sim, is_new = topo_map.localize(living_obs)
+    assert is_new, "Living room should be new location"
+    assert loc_id == 1, "Should be id 1"
+    print(f"    Added living room: loc_id={loc_id}, is_new={is_new}")
+
+    # Localize to similar kitchen observation (should match existing)
+    kitchen_obs2 = create_room_obs([0,0,0,0,0,0,0,0,0,0, 2, 0, 1, 2, 0,0,0])  # slightly different
+    loc_id, sim, is_new = topo_map.localize(kitchen_obs2, threshold=0.5)
+    assert not is_new, "Similar kitchen should match existing"
+    assert loc_id == 0, "Should match kitchen (id 0)"
+    print(f"    Re-localized to kitchen: loc_id={loc_id}, sim={sim:.3f}, is_new={is_new}")
+
+    # Add bedroom
+    loc_id, sim, is_new = topo_map.localize(bedroom_obs)
+    assert is_new, "Bedroom should be new"
+    print(f"    Added bedroom: loc_id={loc_id}")
+
+    assert topo_map.n_locations == 3, f"Should have 3 locations, got {topo_map.n_locations}"
+
+    # Test edges
+    topo_map.record_transition(0, 1, action=1)  # kitchen -> living, forward
+    topo_map.record_transition(1, 2, action=1)  # living -> bedroom, forward
+    topo_map.record_transition(1, 0, action=2)  # living -> kitchen, back
+
+    assert len(topo_map.edges) == 3, "Should have 3 edges"
+
+    # Test A and B matrix generation
+    A = topo_map.get_A_matrix()
+    B = topo_map.get_B_matrix()
+    print(f"    A matrix shape: {A.shape}")
+    print(f"    B matrix shape: {B.shape}")
+
+    print("    [PASS] Topological map works!")
+except Exception as e:
+    print(f"    [FAIL] {e}")
+    raise
+
+# Test 9: Similarity functions
+print("\n[9] Testing similarity functions...")
+try:
+    from pomdp.similarity import (
+        cosine_similarity, jaccard_similarity, euclidean_similarity,
+        is_same_location, batch_cosine_similarity, find_best_match_jit
+    )
+
+    # Test vectors
+    vec1 = np.array([1.0, 0.0, 0.5, 0.0])
+    vec2 = np.array([0.9, 0.1, 0.4, 0.0])
+    vec3 = np.array([0.0, 1.0, 0.0, 0.5])
+
+    # Cosine similarity
+    sim_12 = cosine_similarity(vec1, vec2)
+    sim_13 = cosine_similarity(vec1, vec3)
+    print(f"    cosine(vec1, vec2) = {sim_12:.3f} (should be high)")
+    print(f"    cosine(vec1, vec3) = {sim_13:.3f} (should be low)")
+    assert sim_12 > 0.9, "Similar vectors should have high cosine"
+    assert sim_13 < 0.3, "Different vectors should have low cosine"
+
+    # Jaccard similarity
+    jac = jaccard_similarity(vec1, vec2)
+    print(f"    jaccard(vec1, vec2) = {jac:.3f}")
+
+    # is_same_location
+    assert is_same_location(vec1, vec2, threshold=0.8), "Should match"
+    assert not is_same_location(vec1, vec3, threshold=0.8), "Should not match"
+
+    # JIT batch similarity
+    candidates = jnp.array([vec1, vec2, vec3])
+    query = jnp.array(vec2)
+    sims = batch_cosine_similarity(query, candidates)
+    print(f"    batch_cosine_similarity: {sims}")
+    assert sims[1] > 0.99, "vec2 should match itself"
+
+    # find_best_match_jit
+    best_idx, best_sim = find_best_match_jit(query, candidates)
+    print(f"    best match: idx={best_idx}, sim={best_sim:.3f}")
+    assert int(best_idx) == 1, "Should find vec2 as best match"
+
+    print("    [PASS] Similarity functions work!")
+except Exception as e:
+    print(f"    [FAIL] {e}")
+    raise
+
+# Test 10: Map persistence
+print("\n[10] Testing map persistence...")
+try:
+    import tempfile
+    from pathlib import Path
+    from pomdp.map_persistence import save_map, load_map, list_saved_maps
+
+    # Use temp directory
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        # Save the map we created earlier
+        filepath = save_map(topo_map, name="test_map", maps_dir=tmpdir)
+        assert filepath.exists(), "Map file should exist"
+
+        # List saved maps
+        maps = list_saved_maps(maps_dir=tmpdir)
+        assert len(maps) == 1, "Should have 1 saved map"
+        print(f"    Saved maps: {[m['name'] for m in maps]}")
+
+        # Load the map
+        loaded_map = load_map(name="test_map", maps_dir=tmpdir)
+        assert loaded_map is not None, "Should load successfully"
+        assert loaded_map.n_locations == 3, "Should have 3 locations"
+        assert len(loaded_map.edges) == 3, "Should have 3 edges"
+
+        # Verify A matrix is same
+        A_original = topo_map.get_A_matrix()
+        A_loaded = loaded_map.get_A_matrix()
+        assert jnp.allclose(A_original, A_loaded, atol=1e-5), "A matrices should match"
+
+    print("    [PASS] Map persistence works!")
+except Exception as e:
+    print(f"    [FAIL] {e}")
+    raise
+
 print("\n" + "=" * 50)
 print("All tests passed!")
 print("=" * 50)

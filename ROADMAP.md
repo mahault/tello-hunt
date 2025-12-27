@@ -199,26 +199,39 @@ while running:
   - `encode_yolo_detections()` - convert YOLO boxes to fixed-size token
   - `discretize_person_obs()` - categorical person observation
 
-### Phase 2: Topological Map Module
-- [ ] `pomdp/topological_map.py`:
+### Phase 2: Topological Map Module ✓
+- [x] `pomdp/topological_map.py`:
   - `TopologicalMap` class:
     - `nodes`: list of LocationNode (observation signature, visit count)
-    - `edges`: adjacency dict with transition counts
+    - `edges`: list of Edge with transition counts per action
     - `add_node(observation)` - create new location
     - `find_best_match(observation)` - localization via similarity
+    - `localize(observation)` - find/create location with threshold
     - `add_edge(from_node, to_node, action)` - record transition
+    - `get_A_matrix()` - generate observation likelihood from counts
+    - `get_B_matrix()` - generate transition probabilities from edges
   - `LocationNode` dataclass:
     - `id`: unique identifier
-    - `observation_signature`: object histogram vector
-    - `A_counts`: observation counts at this location
+    - `observation_signature`: running mean of object vectors
+    - `A_counts`: observation counts at this location (N_OBJECT_TYPES, N_OBS_LEVELS)
     - `visit_count`: times visited
-- [ ] `pomdp/similarity.py`:
-  - `compute_similarity(obs1, obs2)` - cosine similarity of object vectors
+    - `update_signature()` - online mean update
+    - `update_A_counts()` - increment observation counts
+  - `Edge` dataclass for transitions with counts
+- [x] `pomdp/similarity.py`:
+  - `cosine_similarity()` - cosine similarity of vectors
+  - `weighted_cosine_similarity()` - with object importance weights
+  - `jaccard_similarity()` - set-based similarity
   - `is_same_location(obs, node, threshold)` - localization decision
-- [ ] `pomdp/map_persistence.py`:
-  - `save_map(path, topo_map)` - serialize graph + counts
+  - `batch_cosine_similarity()` (JIT) - fast similarity to all locations
+  - `find_best_match_jit()` (JIT) - fast localization
+  - `DEFAULT_OBJECT_WEIGHTS` - distinctive object weighting
+- [x] `pomdp/map_persistence.py`:
+  - `save_map(path, topo_map)` - serialize graph + counts to JSON
   - `load_map(path)` - restore learned environment
-  - JSON format for human readability
+  - `load_latest_map()` - load most recent map
+  - `list_saved_maps()` - enumerate saved maps
+  - `export_map_summary()` - human-readable map description
 
 ### Phase 3: World Model POMDP (with topological map)
 - [ ] `pomdp/world_model.py`:
