@@ -28,3 +28,4 @@ from .map_persistence import (
     load_latest_map,
     list_saved_maps,
 )
+from .world_model import WorldModel, LocalizationResult

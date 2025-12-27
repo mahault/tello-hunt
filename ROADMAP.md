@@ -233,13 +233,18 @@ while running:
   - `list_saved_maps()` - enumerate saved maps
   - `export_map_summary()` - human-readable map description
 
-### Phase 3: World Model POMDP (with topological map)
-- [ ] `pomdp/world_model.py`:
-  - `localize(observation)` - find current node or create new
-  - `update_belief_over_locations()` (JIT) - soft belief over nodes
-  - `learn_observation(node, observation)` - update A counts
-  - `learn_transition(from_node, to_node, action)` - update B counts
-  - `get_location_confidence()` - how sure are we of current location?
+### Phase 3: World Model POMDP (with topological map) ✓
+- [x] `pomdp/world_model.py`:
+  - `WorldModel` class - main POMDP for semantic localization
+  - `localize(observation, action)` - update belief, detect new locations
+  - Soft belief over all locations (not hard assignment)
+  - VFE-based novelty detection for new location discovery
+  - Automatic A/B matrix learning from experience
+  - `get_exploration_target()` - EFE-guided action recommendations
+  - `get_location_info()` - query location details
+  - `get_belief_entropy()` - uncertainty measure
+  - Save/load via `WorldModel.save()` and `WorldModel.load()`
+  - `LocalizationResult` dataclass with VFE diagnostics
 
 ### Phase 4: Human Search POMDP
 - [ ] `pomdp/human_search.py`:

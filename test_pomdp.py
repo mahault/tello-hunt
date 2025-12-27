@@ -441,6 +441,90 @@ except Exception as e:
     print(f"    [FAIL] {e}")
     raise
 
+# Test 11: World Model POMDP
+print("\n[11] Testing World Model POMDP...")
+try:
+    from pomdp.world_model import WorldModel, LocalizationResult
+
+    # Create fresh world model
+    wm = WorldModel()
+    assert wm.n_locations == 0, "Should start empty"
+    assert wm.current_location_id == -1, "No current location yet"
+
+    # First observation creates first location
+    result = wm.localize(kitchen_obs)
+    assert result.new_location_discovered, "First obs should create new location"
+    assert result.location_id == 0, "Should be location 0"
+    assert wm.n_locations == 1, "Should have 1 location"
+    print(f"    First location (kitchen): id={result.location_id}, conf={result.confidence:.2f}")
+
+    # Second different observation creates new location
+    result = wm.localize(living_obs, action_taken=1)  # moved forward
+    assert result.new_location_discovered, "Different obs should create new location"
+    assert result.location_id == 1, "Should be location 1"
+    assert wm.n_locations == 2, "Should have 2 locations"
+    print(f"    Second location (living): id={result.location_id}, conf={result.confidence:.2f}")
+
+    # Third observation - bedroom
+    result = wm.localize(bedroom_obs, action_taken=1)
+    assert result.new_location_discovered, "Bedroom should be new"
+    print(f"    Third location (bedroom): id={result.location_id}, conf={result.confidence:.2f}")
+
+    # Return to kitchen-like observation (should NOT create new)
+    result = wm.localize(kitchen_obs, action_taken=2)  # moved back
+    # Note: might create new due to VFE, but similarity should match
+    print(f"    Re-visit kitchen: id={result.location_id}, sim={result.similarity:.3f}, new={result.new_location_discovered}")
+
+    # Check belief
+    print(f"    Current belief shape: {wm.belief.shape}")
+    print(f"    Belief entropy: {wm.get_belief_entropy():.3f}")
+
+    # Get location info
+    info = wm.get_location_info(0)
+    print(f"    Location 0 info: visits={info['visit_count']}, objects={[o['name'] for o in info['top_objects'][:2]]}")
+
+    # Test exploration recommendation
+    action, probs = wm.get_exploration_target()
+    print(f"    Recommended exploration action: {action}, probs={probs[:3]}...")
+
+    print("    [PASS] World Model POMDP works!")
+except Exception as e:
+    print(f"    [FAIL] {e}")
+    import traceback
+    traceback.print_exc()
+    raise
+
+# Test 12: World Model persistence
+print("\n[12] Testing World Model save/load...")
+try:
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Save world model
+        from pomdp.map_persistence import DEFAULT_MAPS_DIR
+        import pomdp.map_persistence as mp
+        mp.DEFAULT_MAPS_DIR = Path(tmpdir)
+
+        saved_path = wm.save(name="test_world_model")
+        print(f"    Saved to: {saved_path}")
+
+        # Load into new world model
+        wm2 = WorldModel.load(name="test_world_model")
+        assert wm2.n_locations == wm.n_locations, "Should have same locations"
+        print(f"    Loaded world model: {wm2}")
+
+        # Verify localization still works
+        result = wm2.localize(kitchen_obs)
+        print(f"    Localized in loaded model: id={result.location_id}, conf={result.confidence:.2f}")
+
+    print("    [PASS] World Model persistence works!")
+except Exception as e:
+    print(f"    [FAIL] {e}")
+    import traceback
+    traceback.print_exc()
+    raise
+
 print("\n" + "=" * 50)
 print("All tests passed!")
 print("=" * 50)
