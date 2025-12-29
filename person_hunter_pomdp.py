@@ -41,11 +41,16 @@ from pomdp import (
 )
 from pomdp.config import MAX_FB, MAX_YAW, SEARCH_YAW
 
+# CSCG + VBGS modules
+from mapping.cscg import CSCGWorldModel
+from mapping.vbgs_place import PlaceManager
+
 # Safety module
 from safety import SafetyMonitor, SafetyState, SafetyOverride
 
 # Utilities
 from utils import FrameGrabber, clamp
+from utils.spatial_map import SpatialMap, combine_with_map
 
 # Suppress djitellopy logging
 import logging
@@ -85,34 +90,60 @@ class POMDPController:
         YOLO frame -> ObservationToken -> WorldModel -> [Exploration | HumanSearch+Interaction] -> RC Control
     """
 
-    def __init__(self, load_existing_map: bool = True, start_in_exploration: bool = True):
+    def __init__(
+        self,
+        load_existing_map: bool = True,
+        start_in_exploration: bool = True,
+        use_cscg: bool = False
+    ):
         """
         Initialize all POMDPs.
 
         Args:
             load_existing_map: If True, try to load most recent saved map
             start_in_exploration: If True, start in exploration mode
+            use_cscg: If True, use CSCG backend instead of TopologicalMap
         """
-        # Try to load existing map
-        self.world_model = None
-        if load_existing_map:
-            try:
-                self.world_model = WorldModel.load()
-                if self.world_model is not None:
-                    print(f"Loaded existing map with {self.world_model.n_locations} locations")
-            except Exception as e:
-                print(f"Could not load existing map: {e}")
+        self.use_cscg = use_cscg
 
-        if self.world_model is None:
+        # Initialize world model based on backend choice
+        self.world_model = None
+        self.cscg_model = None
+
+        if use_cscg:
+            # Use CSCG backend
+            print("Initializing CSCG (Clone-Structured Cognitive Graph) backend...")
+            self.cscg_model = CSCGWorldModel(
+                n_clones_per_token=10,  # Clones per observation token
+                n_tokens=64,            # Max discrete observation tokens
+                embedding_dim=512,      # CLIP embedding dimension
+            )
+            # Create a minimal WorldModel for compatibility
             self.world_model = WorldModel()
-            print("Starting with fresh world model")
+            # Spatial map for visualization
+            self.spatial_map = SpatialMap(width=400, height=400)
+            print("CSCG backend initialized")
         else:
-            # Print info about loaded locations
-            print("Loaded locations:")
-            for loc_id in range(self.world_model.n_locations):
-                info = self.world_model.get_location_info(loc_id)
-                objs = ", ".join([o['name'] for o in info.get('top_objects', [])[:3]]) or "no objects"
-                print(f"  Loc {loc_id}: [{objs}] visits={info.get('visit_count', 0)}")
+            # Use standard TopologicalMap backend
+            self.spatial_map = None
+            if load_existing_map:
+                try:
+                    self.world_model = WorldModel.load()
+                    if self.world_model is not None:
+                        print(f"Loaded existing map with {self.world_model.n_locations} locations")
+                except Exception as e:
+                    print(f"Could not load existing map: {e}")
+
+            if self.world_model is None:
+                self.world_model = WorldModel()
+                print("Starting with fresh world model")
+            else:
+                # Print info about loaded locations
+                print("Loaded locations:")
+                for loc_id in range(self.world_model.n_locations):
+                    info = self.world_model.get_location_info(loc_id)
+                    objs = ", ".join([o['name'] for o in info.get('top_objects', [])[:3]]) or "no objects"
+                    print(f"  Loc {loc_id}: [{objs}] visits={info.get('visit_count', 0)}")
 
         # Initialize other POMDPs
         n_locs = max(1, self.world_model.n_locations)
@@ -158,11 +189,26 @@ class POMDPController:
         )
 
         # 2. World Model: localize and update location belief
-        loc_result = self.world_model.localize(obs, action_taken=self._last_action_idx, frame=frame)
+        if self.use_cscg and self.cscg_model is not None:
+            # Use CSCG backend for localization
+            loc_result = self.cscg_model.localize(
+                frame=frame,
+                action_taken=self._last_action_idx,
+                observation_token=obs,
+            )
+            # Update spatial map for visualization
+            if self.spatial_map is not None:
+                self.spatial_map.update(loc_result.token, self._last_action_idx)
+            # Also update the basic world model for compatibility
+            _ = self.world_model.localize(obs, action_taken=self._last_action_idx, frame=frame)
+        else:
+            # Use standard TopologicalMap backend
+            loc_result = self.world_model.localize(obs, action_taken=self._last_action_idx, frame=frame)
 
         # 3. Handle location expansion in HumanSearch
         if loc_result.new_location_discovered:
-            self.human_search.expand_to_locations(self.world_model.n_locations)
+            n_locs = self.cscg_model.n_clone_states if self.use_cscg else self.world_model.n_locations
+            self.human_search.expand_to_locations(n_locs)
 
         # 4. Mode-specific update
         if self.mode == "exploration":
@@ -271,6 +317,12 @@ class POMDPController:
         """Save the learned world model map."""
         return self.world_model.save(name=name)
 
+    def render_spatial_map(self) -> Optional[np.ndarray]:
+        """Render the spatial map (CSCG only)."""
+        if self.spatial_map is not None:
+            return self.spatial_map.render()
+        return None
+
     def get_diagnostics(self) -> Dict:
         """Get diagnostic info from all POMDPs."""
         human_stats = self.human_search.get_statistics()
@@ -298,6 +350,16 @@ class POMDPController:
 
         if self.mode == "exploration":
             diag['exploration'] = self.exploration.get_statistics()
+
+        # Add CSCG-specific diagnostics
+        if self.use_cscg and self.cscg_model is not None:
+            diag['cscg'] = {
+                'n_tokens': self.cscg_model.tokenizer.n_tokens if hasattr(self.cscg_model, 'tokenizer') else 0,
+                'n_clone_states': self.cscg_model.n_clone_states,
+                'current_clone': self.cscg_model.current_clone_state,
+                'current_token': self.cscg_model.current_token,
+                'n_places': self.cscg_model.place_manager.n_places if hasattr(self.cscg_model, 'place_manager') else 0,
+            }
 
         return diag
 
@@ -337,12 +399,21 @@ def draw_pomdp_overlay(
 
     # Location info (top left)
     loc = result['localization']
-    cv2.putText(frame, f"LOC: {loc.location_id} ({loc.confidence:.0%}) sim={loc.similarity:.2f}", (20, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_WHITE, 2)
+
+    # Check if this is CSCG result (has token attribute)
+    if hasattr(loc, 'token'):
+        # CSCG mode: show token and clone state
+        cv2.putText(frame, f"TKN: {loc.token} CLONE: {loc.clone_state} ({loc.confidence:.0%})", (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_WHITE, 2)
+    else:
+        # Standard mode: show location
+        cv2.putText(frame, f"LOC: {loc.location_id} ({loc.confidence:.0%}) sim={loc.similarity:.2f}", (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_WHITE, 2)
 
     # New location indicator
     if loc.new_location_discovered:
-        cv2.putText(frame, "NEW LOCATION!", (20, 150),
+        indicator_text = "NEW TOKEN!" if hasattr(loc, 'token') else "NEW LOCATION!"
+        cv2.putText(frame, indicator_text, (20, 150),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_YELLOW, 2)
 
     # Mode-specific overlay
@@ -493,6 +564,19 @@ def main():
         action="store_true",
         help="Don't save the map on exit"
     )
+    parser.add_argument(
+        "--cscg",
+        action="store_true",
+        help="Use CSCG (Clone-Structured Cognitive Graph) backend for world model"
+    )
+    parser.add_argument(
+        "--simulate",
+        type=str,
+        nargs='?',
+        const='webcam',
+        default=None,
+        help="Simulate with webcam (default) or video file path. No drone needed."
+    )
     args = parser.parse_args()
 
     # Check for YOLO weights
@@ -516,7 +600,7 @@ def main():
         safety = SafetyMonitor(tello)
 
         # Initialize POMDP controller (loads existing map if available)
-        pomdp = POMDPController(load_existing_map=True)
+        pomdp = POMDPController(load_existing_map=True, use_cscg=args.cscg)
 
         # Start video stream
         try:
@@ -558,6 +642,17 @@ def main():
             if frame is not None:
                 model(frame, imgsz=YOLO_IMG_SIZE, verbose=False)
 
+        # Pre-load CLIP if using CSCG (to avoid blocking during flight)
+        if args.cscg and pomdp.cscg_model is not None:
+            print("Pre-loading CLIP model...")
+            frame = grabber.get_frame()
+            if frame is not None:
+                # This triggers lazy loading of the image encoder
+                _ = pomdp.cscg_model._get_image_encoder()
+                # Do a warmup encode
+                pomdp.cscg_model._get_image_encoder().encode(frame)
+            print("CLIP ready.")
+
         # === GROUND TEST MODE ===
         if args.ground_test:
             print("\n=== GROUND TEST MODE ===")
@@ -597,24 +692,50 @@ def main():
                 cv2.putText(overlay_frame, "GROUND TEST", (w // 2 - 80, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-                cv2.imshow("POMDP Hunter", overlay_frame)
+                # Combine with spatial map if using CSCG
+                spatial_map_img = pomdp.render_spatial_map()
+                if spatial_map_img is not None:
+                    display_frame = combine_with_map(overlay_frame, spatial_map_img)
+                else:
+                    display_frame = overlay_frame
+
+                cv2.imshow("POMDP Hunter", display_frame)
 
                 # Log every 30 frames
                 if frame_count % 30 == 0:
                     diag = pomdp.get_diagnostics()
                     loc_info = pomdp.world_model.get_location_info()
                     top_objs = ", ".join([o['name'] for o in loc_info.get('top_objects', [])[:3]])
-                    if result['mode'] == 'exploration':
-                        explore_stats = diag.get('exploration', {})
-                        print(f"[{frame_count}] Mode=EXPLORE, "
-                              f"Loc={diag['world_model']['current_location']} [{top_objs}], "
-                              f"Locations={diag['world_model']['n_locations']}, "
-                              f"State={explore_stats.get('state', 'unknown')}, "
-                              f"VFE={explore_stats.get('mean_vfe', 0):.2f}")
+
+                    # CSCG-specific logging
+                    if 'cscg' in diag:
+                        cscg = diag['cscg']
+                        if result['mode'] == 'exploration':
+                            explore_stats = diag.get('exploration', {})
+                            print(f"[{frame_count}] Mode=EXPLORE CSCG, "
+                                  f"Token={cscg['current_token']}, "
+                                  f"Clone={cscg['current_clone']}/{cscg['n_clone_states']}, "
+                                  f"Tokens={cscg['n_tokens']}, "
+                                  f"Places={cscg['n_places']}, "
+                                  f"VFE={explore_stats.get('mean_vfe', 0):.2f}")
+                        else:
+                            print(f"[{frame_count}] Mode=HUNT CSCG, "
+                                  f"Token={cscg['current_token']}, "
+                                  f"Clone={cscg['current_clone']}, "
+                                  f"State={diag['interaction']['engagement_state']}")
                     else:
-                        print(f"[{frame_count}] Mode=HUNT, "
-                              f"Loc={diag['world_model']['current_location']} [{top_objs}], "
-                              f"State={diag['interaction']['engagement_state']}")
+                        # Standard TopologicalMap logging
+                        if result['mode'] == 'exploration':
+                            explore_stats = diag.get('exploration', {})
+                            print(f"[{frame_count}] Mode=EXPLORE, "
+                                  f"Loc={diag['world_model']['current_location']} [{top_objs}], "
+                                  f"Locations={diag['world_model']['n_locations']}, "
+                                  f"State={explore_stats.get('state', 'unknown')}, "
+                                  f"VFE={explore_stats.get('mean_vfe', 0):.2f}")
+                        else:
+                            print(f"[{frame_count}] Mode=HUNT, "
+                                  f"Loc={diag['world_model']['current_location']} [{top_objs}], "
+                                  f"State={diag['interaction']['engagement_state']}")
 
                 # Keyboard input
                 key = cv2.waitKey(1) & 0xFF
@@ -756,7 +877,14 @@ def main():
                 cv2.putText(frame, f"{label} {conf:.0%}", (x1, y1 - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-            cv2.imshow("POMDP Hunter", frame)
+            # Combine with spatial map if using CSCG
+            spatial_map_img = pomdp.render_spatial_map()
+            if spatial_map_img is not None:
+                display_frame = combine_with_map(frame, spatial_map_img)
+            else:
+                display_frame = frame
+
+            cv2.imshow("POMDP Hunter", display_frame)
 
             # 6. LOGGING (periodic)
             if frame_count % 60 == 0:

@@ -28,3 +28,17 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+nul
+
+# Datasets (download separately)
+datasets/
+test_output/
+
+# Test images
+*.png
+*.jpg
+!maps/*.png
+
+# 3D model archives (keep .glb only)
+*.zip
+*.usdz

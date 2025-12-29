@@ -2,8 +2,11 @@
 Exploration Mode POMDP for systematic environment mapping.
 
 This module provides exploration behavior that prioritizes building
-the topological map before hunting for people. Uses VFE (Variational
-Free Energy) as the signal for exploration completion.
+the topological map before hunting for people.
+
+Two-phase design:
+1. Bootstrap: Simple exploration to give CSCG initial data
+2. CSCG-driven: Delegate to CSCG's EFE-based action selection
 
 Key principles:
 - High VFE / High Surprisal = Observations don't fit model → keep exploring
@@ -37,9 +40,13 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
-# Exploration State Indices
+# Exploration Phase Constants
 # =============================================================================
 
+BOOTSTRAP = 0       # Initial exploration before CSCG has learned
+CSCG_DRIVEN = 1     # CSCG drives exploration via EFE
+
+# For backwards compatibility with state names
 SCANNING = 0
 APPROACHING_FRONTIER = 1
 BACKTRACKING = 2
@@ -195,22 +202,80 @@ class ExplorationModePOMDP:
         world_model: 'WorldModel',
         loc_result: 'LocalizationResult',
     ) -> int:
-        """Select action based on current exploration state."""
+        """
+        Select action using two-phase approach:
+        1. Bootstrap: Simple scan + forward until CSCG has learned
+        2. CSCG-driven: Delegate to CSCG's EFE-based exploration
+        """
+        n_locations = world_model.n_locations
+        debug = (self._total_frames % 30 == 0)  # Debug every 30 frames
 
-        if self._state == SCANNING:
-            return self._scanning_action()
+        # Phase 1: Bootstrap - CSCG hasn't learned enough yet
+        if n_locations < 2:
+            if debug:
+                print(f"  [EXPLORE] Bootstrap phase (n_locs={n_locations})")
+            return self._bootstrap_action(debug=debug)
 
-        elif self._state == APPROACHING_FRONTIER:
-            return self._frontier_action(world_model)
+        # Phase 2: CSCG-driven - use EFE-based exploration target
+        if hasattr(world_model, 'get_exploration_target'):
+            action_idx, reason = world_model.get_exploration_target()
+            if debug:
+                print(f"  [EXPLORE] CSCG-driven: action={action_idx}, reason={reason}")
+            return int(action_idx)
 
-        elif self._state == BACKTRACKING:
-            return self._backtrack_action()
+        # Fallback to bootstrap if no CSCG
+        return self._bootstrap_action(debug=debug)
 
-        elif self._state == TRANSITIONING:
-            # Stay in place during transition
-            return 0  # stay
+    def _bootstrap_action(self, debug: bool = False) -> int:
+        """
+        Bootstrap exploration: find open paths and move forward.
 
-        return 4  # right (default to scanning)
+        Strategy:
+        - Try forward first
+        - If blocked (tracked via _consecutive_blocked), rotate to find open path
+        - Once we find an open direction, move forward
+
+        Returns action index.
+        """
+        # Initialize blocked counter if needed
+        if not hasattr(self, '_consecutive_blocked'):
+            self._consecutive_blocked = 0
+            self._last_move_succeeded = True
+
+        self._rotation_frames += 1
+
+        # If we were blocked last time, rotate to find open path
+        if self._consecutive_blocked > 0:
+            if debug:
+                print(f"  [BOOTSTRAP] blocked {self._consecutive_blocked}x, rotating to find path")
+            # After rotating, try forward again
+            if self._rotation_frames % 3 == 0:  # Every 3rd frame try forward
+                return 1  # forward
+            return 4  # rotate right
+
+        # Normal exploration: mostly forward with occasional scan
+        cycle_pos = self._rotation_frames % 60
+        if cycle_pos < 15:
+            # Brief scan phase
+            if debug:
+                print(f"  [BOOTSTRAP] scan phase (cycle {cycle_pos})")
+            return 4  # right
+        else:
+            # Longer move phase - really try to go somewhere
+            if debug:
+                print(f"  [BOOTSTRAP] move phase (cycle {cycle_pos})")
+            return 1  # forward
+
+    def record_movement_result(self, action: int, succeeded: bool):
+        """Record whether a movement action succeeded (didn't hit wall)."""
+        if not hasattr(self, '_consecutive_blocked'):
+            self._consecutive_blocked = 0
+
+        if action == 1:  # forward
+            if succeeded:
+                self._consecutive_blocked = 0
+            else:
+                self._consecutive_blocked += 1
 
     def _scanning_action(self) -> int:
         """
@@ -251,29 +316,23 @@ class ExplorationModePOMDP:
         return 2  # back
 
     def _update_state(self, world_model: 'WorldModel') -> None:
-        """Update exploration state based on conditions."""
+        """
+        Update exploration phase based on CSCG learning progress.
 
-        if self._state == SCANNING:
-            # After completing at least one rotation, consider moving
-            if self._rotations_completed >= 1 and self._frames_in_state > 100:
-                # If we have locations and haven't found new ones recently,
-                # try moving to a frontier
-                if world_model.n_locations >= 1:
-                    self._transition_to(APPROACHING_FRONTIER)
+        Simple two-phase logic:
+        - Bootstrap (state=0) until CSCG has 2+ locations
+        - CSCG-driven (state=1) after that
+        """
+        n_locations = world_model.n_locations
 
-        elif self._state == APPROACHING_FRONTIER:
-            # If stuck (no new locations for many frames), try backtracking
-            if self._frames_without_new_location > 150:
-                self._transition_to(BACKTRACKING)
-
-            # If we've been approaching for a while, go back to scanning
-            if self._frames_in_state > 200:
-                self._transition_to(SCANNING)
-
-        elif self._state == BACKTRACKING:
-            # After backtracking for a bit, go back to scanning
-            if self._frames_in_state > 60:
-                self._transition_to(SCANNING)
+        if n_locations < 2:
+            # Still in bootstrap phase
+            if self._state != BOOTSTRAP:
+                self._transition_to(BOOTSTRAP)
+        else:
+            # CSCG has learned enough - it drives exploration
+            if self._state != CSCG_DRIVEN:
+                self._transition_to(CSCG_DRIVEN)
 
     def _transition_to(self, new_state: int) -> None:
         """Transition to a new exploration state."""
@@ -288,33 +347,40 @@ class ExplorationModePOMDP:
         world_model: 'WorldModel',
     ) -> Tuple[bool, str]:
         """
-        Check if exploration is complete using VFE metrics.
+        Check if exploration is complete using model uncertainty.
 
-        Transition when:
-        1. Mean VFE is low (observations fit the model)
-        2. VFE variance is low (stable, not fluctuating)
-        3. At least one location has been established
+        Uses CSCG's exploration urgency if available, otherwise falls back to VFE.
 
         Returns:
             (should_transition, reason)
         """
         n_locs = world_model.n_locations
 
-        # Need at least one location
-        if n_locs < 1:
-            return False, "No locations discovered yet"
+        # Need minimum exploration time
+        min_frames = 200
+        if self._total_frames < min_frames:
+            return False, f"Exploring ({self._total_frames}/{min_frames} frames)"
 
-        # Need enough VFE history
+        # Check CSCG's exploration urgency if available
+        if hasattr(world_model, 'get_exploration_urgency'):
+            urgency, urgency_reason = world_model.get_exploration_urgency()
+            if urgency > 0.3:
+                return False, urgency_reason
+            # Model is well-explored according to CSCG
+            return True, f"Exploration complete: {urgency_reason}"
+
+        # Fallback to VFE-based check
+        if n_locs < 2:
+            return False, f"Need more locations ({n_locs}/2)"
+
         if len(self._vfe_history) < self.vfe_window // 2:
             return False, f"Gathering VFE data ({len(self._vfe_history)}/{self.vfe_window})"
 
         mean_vfe, vfe_var = self.get_vfe_stats()
 
-        # Check VFE threshold
         if mean_vfe > self.vfe_threshold:
             return False, f"VFE too high ({mean_vfe:.2f} > {self.vfe_threshold})"
 
-        # Check variance threshold
         if vfe_var > self.vfe_variance_threshold:
             return False, f"VFE unstable (var={vfe_var:.2f} > {self.vfe_variance_threshold})"
 
@@ -346,6 +412,7 @@ class ExplorationModePOMDP:
         self._rotations_completed = 0
         self._frames_without_new_location = 0
         self._last_n_locations = 0
+        self._consecutive_blocked = 0
 
     def get_statistics(self) -> dict:
         """Get exploration statistics."""

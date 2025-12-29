@@ -1,15 +1,15 @@
 """
 Image embedding encoder for stable location signatures.
 
-Uses CLIP (Contrastive Language-Image Pre-training) to extract
-semantic image embeddings that are more stable than YOLO object
-detection histograms for place recognition.
+Supports multiple encoders:
+- CLIP: Semantic embeddings (good for real-world scenes)
+- DINOv2: Self-supervised structural features (better for place recognition)
 
-CLIP advantages:
-- Trained on 400M image-text pairs
-- Understands scene semantics
-- Robust to viewpoint changes
-- Captures "place-ness" better than object counts
+DINOv2 advantages for place recognition:
+- Self-supervised on images only (no text bias)
+- Captures structural and textural features
+- Better at distinguishing visually similar but different places
+- More sensitive to low-level visual differences
 """
 
 import numpy as np
@@ -19,6 +19,8 @@ import cv2
 # Lazy imports to avoid loading heavy models at module import
 _clip_model = None
 _clip_processor = None
+_dino_model = None
+_dino_processor = None
 _device = None
 
 
@@ -62,11 +64,55 @@ def _load_clip():
         ) from e
 
 
+def _load_dino():
+    """Lazy load DINOv2 model on first use."""
+    global _dino_model, _dino_processor, _device
+
+    if _dino_model is not None:
+        return _dino_model, _dino_processor, _device
+
+    try:
+        import torch
+        from transformers import AutoImageProcessor, AutoModel
+
+        # Use GPU if available
+        if torch.cuda.is_available():
+            _device = "cuda"
+            print(f"Loading DINOv2 model on GPU ({torch.cuda.get_device_name(0)})...")
+        else:
+            _device = "cpu"
+            print("Loading DINOv2 model on CPU...")
+
+        # DINOv2 small model - good balance of speed and quality
+        model_name = "facebook/dinov2-small"
+
+        try:
+            _dino_processor = AutoImageProcessor.from_pretrained(model_name, local_files_only=True)
+            _dino_model = AutoModel.from_pretrained(model_name, local_files_only=True)
+        except Exception:
+            print("DINOv2 not cached, downloading from HuggingFace...")
+            _dino_processor = AutoImageProcessor.from_pretrained(model_name)
+            _dino_model = AutoModel.from_pretrained(model_name)
+
+        _dino_model.to(_device)
+        _dino_model.eval()
+        print("DINOv2 model loaded.")
+
+        return _dino_model, _dino_processor, _device
+
+    except ImportError as e:
+        raise ImportError(
+            "DINOv2 requires transformers and torch. Install with:\n"
+            "  pip install transformers torch"
+        ) from e
+
+
 # =============================================================================
-# Embedding dimension
+# Embedding dimensions
 # =============================================================================
 
 CLIP_EMBEDDING_DIM = 512  # CLIP ViT-B/32 output dimension
+DINO_EMBEDDING_DIM = 384  # DINOv2-small output dimension
 
 
 # =============================================================================
@@ -202,6 +248,126 @@ class ImageEncoder:
     def embedding_dim(self) -> int:
         """Return embedding dimension."""
         return CLIP_EMBEDDING_DIM
+
+
+# =============================================================================
+# DINOv2 Encoder Class
+# =============================================================================
+
+class DINOv2Encoder:
+    """
+    Encodes images using DINOv2 self-supervised features.
+
+    Better for place recognition than CLIP because:
+    - No text supervision bias (pure visual learning)
+    - Captures structural and textural features
+    - More sensitive to visual differences between places
+
+    Usage:
+        encoder = DINOv2Encoder()
+        embedding = encoder.encode(frame)  # Returns (384,) numpy array
+    """
+
+    def __init__(self, model_name: str = "facebook/dinov2-small"):
+        """
+        Initialize the DINOv2 encoder.
+
+        Args:
+            model_name: HuggingFace model name for DINOv2
+                - "facebook/dinov2-small" (384 dim, fastest)
+                - "facebook/dinov2-base" (768 dim)
+                - "facebook/dinov2-large" (1024 dim)
+        """
+        self.model_name = model_name
+        self._model = None
+        self._processor = None
+        self._device = None
+
+        # Embedding dim depends on model
+        if "small" in model_name:
+            self._embedding_dim = 384
+        elif "base" in model_name:
+            self._embedding_dim = 768
+        elif "large" in model_name:
+            self._embedding_dim = 1024
+        else:
+            self._embedding_dim = 384
+
+        # Cache for temporal smoothing
+        self._embedding_history: list = []
+        self._max_history: int = 5
+
+    def _ensure_loaded(self):
+        """Ensure model is loaded."""
+        if self._model is None:
+            self._model, self._processor, self._device = _load_dino()
+
+    def encode(
+        self,
+        frame: np.ndarray,
+        normalize: bool = True,
+        temporal_smooth: bool = True,
+    ) -> np.ndarray:
+        """
+        Encode a frame to a DINOv2 embedding vector.
+
+        Args:
+            frame: BGR image from OpenCV (H, W, 3)
+            normalize: Whether to L2-normalize the embedding
+            temporal_smooth: Average with recent embeddings for stability
+
+        Returns:
+            Embedding vector of shape (384,) for dinov2-small
+        """
+        self._ensure_loaded()
+
+        import torch
+
+        # Convert BGR to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Preprocess for DINOv2
+        inputs = self._processor(images=rgb_frame, return_tensors="pt")
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}
+
+        # Extract features (CLS token)
+        with torch.no_grad():
+            outputs = self._model(**inputs)
+            # Use CLS token (first token) as image representation
+            embedding = outputs.last_hidden_state[:, 0, :]
+
+        # Convert to numpy
+        embedding = embedding.cpu().numpy().squeeze()
+
+        # L2 normalize
+        if normalize:
+            norm = np.linalg.norm(embedding)
+            if norm > 0:
+                embedding = embedding / norm
+
+        # Temporal smoothing
+        if temporal_smooth:
+            self._embedding_history.append(embedding)
+            if len(self._embedding_history) > self._max_history:
+                self._embedding_history.pop(0)
+
+            if len(self._embedding_history) > 1:
+                embedding = np.mean(self._embedding_history, axis=0)
+                if normalize:
+                    norm = np.linalg.norm(embedding)
+                    if norm > 0:
+                        embedding = embedding / norm
+
+        return embedding
+
+    def reset_history(self):
+        """Clear temporal smoothing history."""
+        self._embedding_history.clear()
+
+    @property
+    def embedding_dim(self) -> int:
+        """Return embedding dimension."""
+        return self._embedding_dim
 
 
 # =============================================================================

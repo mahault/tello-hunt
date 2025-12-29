@@ -354,156 +354,369 @@ while running:
 - Different angles show different object subsets
 - Empty walls/floors create spurious "unique" signatures
 
-**Solution Options (in order of complexity):**
-
-#### Option A: Image Embeddings (Recommended First)
-Replace YOLO object signatures with pre-trained CNN image features.
+#### Option A: Semantic Image Embeddings (TESTED - INADEQUATE)
 
 - [x] `pomdp/image_encoder.py`:
-  - `ImageEncoder` class using CLIP or ResNet
+  - `ImageEncoder` class using CLIP ViT-B/32 (512-dim)
+  - `DINOv2Encoder` class using DINOv2-small (384-dim)
   - `encode_frame(frame) -> np.ndarray` - extract embedding vector
   - Cosine similarity on embeddings for location matching
-- [ ] Update `TopologicalMap` to store image embeddings
-- [ ] Update `WorldModel` to use embeddings for localization
 
-**Benefits:**
-- More stable than object detection histograms
-- Captures visual scene similarity better
-- CLIP understands semantic scene content
-- Quick to implement and test
+**Testing Results (3D Simulator):**
 
-**Dependencies:**
-```yaml
-- pip:
-    - transformers>=4.30.0
-    - torch>=2.0.0
+| Model | Living↔Kitchen | Living↔Bathroom | Kitchen↔Bedroom | Threshold |
+|-------|----------------|-----------------|-----------------|-----------|
+| CLIP | 0.931 | 0.916 | 0.991 | 0.85 |
+| DINOv2 | 0.817 | 0.880 | 0.807 | 0.85 |
+
+**Key Finding:** Semantic embeddings fail for place recognition because:
+- CLIP/DINOv2 trained for "what is this image?" (semantic)
+- Navigation needs "have I been here before?" (spatial)
+- Indoor rooms dominated by walls, floors, partial furniture
+- All rooms look like "indoor space" to semantic models
+- Viewpoint changes drastically affect embeddings
+
+**Conclusion:** Semantic embeddings are not the right tool for embodied navigation.
+
+#### Option B: ORB Keyframe Place Recognition (TESTED - PROMISING)
+
+- [x] `pomdp/place_recognizer.py`:
+  - `ORBPlaceRecognizer` class - local feature matching
+  - `preload_room(frames, name)` - bootstrap with known rooms
+  - `recognize(frame)` - match against keyframe database
+  - Lowe's ratio test for robust matching
+
+**Testing Results (3D Simulator):**
+- 50% accuracy on synthetic rooms
+- Works well on rooms with texture (Hallway: 500 features)
+- Fails on plain rooms (Bedroom: 19 features, Bathroom: 18 features)
+- **Key insight:** ORB needs real-world texture (edges, corners, patterns)
+
+**Why ORB is fundamentally right:**
+- Local features are viewpoint-robust
+- Captures corners, edges, texture (not semantics)
+- "Have I seen this pattern before?" vs "What room is this?"
+- Industry standard for visual place recognition and SLAM
+
+**Limitation:** Our synthetic 3D simulator lacks real-world texture complexity.
+
+#### Option C: Full Place Recognition Stack (RECOMMENDED)
+
+Based on robotics literature and testing insights:
+
+1. **ORB/AKAZE Keyframes** - viewpoint-stable local features
+   - Keyframe graph: nodes = keyframes, edges = visual similarity + motion
+   - Works well in real environments with natural texture
+
+2. **Object-Centric Spatial Layouts** - structured YOLO
+   - Not just "what objects" but "where objects are relative to you"
+   - `{couch:left:near, tv:center:far}` as location signature
+
+3. **Motion-Conditioned Recognition** - sequences, not frames
+   - Embed N-frame windows (0.5-1.0s)
+   - CSCG explicitly models (action, observation) sequences
+   - Drastically reduces perceptual aliasing
+
+4. **Visual Odometry** - rough is enough
+   - "I moved forward", "I rotated left"
+   - Stabilizes place matching
+   - Improves CSCG transition learning
+
+**Why this stack works:**
+```
+ORB features + keyframes → place IDs
+YOLO object layouts     → semantic hints
+Optical flow / VO       → motion cues
+CSCG                    → resolves aliasing + hierarchy
+VBGS                    → local geometry refinement
+JAX POMDP              → action selection
 ```
 
-#### Option B: CSCG (Clone-Structured Cognitive Graphs)
-More principled solution for perceptual aliasing - see Phase 10.
+This is how biological and robotic navigation actually works.
 
-#### Option C: VBGS (3D Gaussian Splatting)
-Full 3D mapping with geometry - requires pose estimation first - see Phases 11-12.
+### Phase 9b: 3D Simulator Development
 
-### Phase 9b: Testing & Iteration
-- [ ] Test image embedding localization with stationary drone
-- [ ] Test location inference accuracy
-- [ ] Flight testing with learning enabled
-- [ ] Verify map persistence across sessions
+- [x] `simulator/simple_3d.py`:
+  - Raycasting 3D renderer with textured walls
+  - 5-room house layout (Living Room, Kitchen, Hallway, Bedroom, Bathroom)
+  - Furniture rendering (sofa, bed, fridge, bathtub, etc.)
+  - Collision detection for walls and furniture
+  - Minimap overlay
+
+- [x] `simulator/glb_simulator.py`:
+  - **NEW: GLB model-based 3D renderer using pyrender**
+  - Loads realistic house model (simple_house.glb)
+  - First-person navigation with WASD controls
+  - Real textures, furniture, lighting
+  - Camera positioning and orientation control
+
+- [x] `test_full_pipeline.py`:
+  - Autonomous exploration test with CSCG
+  - Visual feedback with OpenCV
+  - Mode switching (exploration/hunting)
+  - Debug output for place recognition
+
+**ORB Testing Results Comparison:**
+
+| Environment | Avg Features | Recognition Accuracy | Loop Closure |
+|-------------|--------------|---------------------|--------------|
+| Simple Raycaster | 20-500 | 50% | Unreliable |
+| **GLB House Model** | **463.7** | **87.5%** | **100% confidence** |
+
+**Key Finding:** Realistic 3D models provide the texture ORB needs.
+
+**GLB Simulator Advantages:**
+- Consistent 500 features per frame (vs variable 20-500)
+- Proper lighting and shadows create natural gradients
+- Realistic furniture with textures
+- Successfully detects loop closure (return to start)
+
+**Simple Raycaster Limitations:**
+- Solid-color walls lack feature points
+- Simple textures don't generate enough keypoints
+- Furniture rendered as flat colored boxes
 
 ---
 
-## Future: CSCG + VBGS Integration
+## Phase 10: CSCG + VBGS Unified Cognitive Mapping (IN PROGRESS)
 
-### Phase 10: CSCG Cognitive Map (Clone-Structured Cognitive Graphs)
+### Overview
 
-**Goal:** Replace simple topological map with CSCG for better perceptual aliasing handling and hierarchical room discovery.
+Integrate **Clone-Structured Cognitive Graphs (CSCG)** and **Variational Bayesian Gaussian Splatting (VBGS)** together for robust place recognition and topological mapping.
+
+**Key Insight:** Use VBGS as "local place models" without requiring accurate metric poses (markerless Option 1). CSCG handles the graph structure and perceptual aliasing.
+
+### Architecture
+
+```
+Frame → CLIP embedding → Token clustering → CSCG inference → Clone state belief
+              ↓                                      ↓
+         Keyframe?                              Graph structure
+              ↓                                      ↓
+    VBGS local place model              POMDP belief update
+              ↓                                      ↓
+    - ELBO (place evidence)              - Location belief
+    - Sub-area structure                 - Action selection
+```
+
+**Two Complementary Systems:**
+
+| Component | Role | Output |
+|-----------|------|--------|
+| **CSCG** | Graph structure + clone disambiguation | T matrix (transitions), E matrix (emissions), clone states |
+| **VBGS** | Local place appearance model | ELBO (fit quality), rendered expected view, sub-area Gaussians |
+
+### Phase 10a: CSCG Implementation ✓ IN PROGRESS
 
 **Reference:** [vicariousinc/naturecomm_cscg](https://github.com/vicariousinc/naturecomm_cscg)
 
-**Architecture:**
-- CSCG learns a "cloned" hidden state space to resolve perceptual aliasing
-- Community detection on cloned graph reveals room-level hierarchy
-- Two time scales: low-level (clone states) and high-level (room communities)
+**Core Concept:** Clone-structured Hidden Markov Model (CHMM)
+- Multiple "clone" states can emit the same observation
+- Resolves perceptual aliasing (two hallways look the same)
+- Learns transition structure T(z'|z,a) and emission structure E(x|z)
 
 **Files to Create:**
+- [ ] `mapping/__init__.py` - Mapping package
 - [ ] `mapping/cscg/__init__.py` - CSCG package
-- [ ] `mapping/cscg/cscg_bridge.py`:
-  - `CSCGBridge` class:
-    - `__init__(num_tokens, num_actions, num_clones)`
-    - `update(action, token)` - online/mini-batch EM update
-    - `clone_belief(token)` - infer p(z|x)
-    - `communities()` - room-level clusters via community detection
-  - Convert observation tokens to CSCG alphabet
-  - Run community detection for hierarchy
+- [ ] `mapping/cscg/chmm.py` - Core CHMM implementation:
+  - `CHMM` class (adapted from naturecomm_cscg):
+    - `__init__(n_clones, n_obs, n_actions)` - initialize with clone counts per observation
+    - `forward(x, a)` - forward message passing, returns log-likelihood
+    - `backward(x, a)` - backward message passing
+    - `decode(x, a)` - MAP state sequence via Viterbi
+    - `learn_em_T(x, a)` - EM learning for transition matrix
+    - `learn_em_E(x, a)` - EM learning for emission matrix
+    - `sample(length)` - generate sequences from model
+    - `bridge(state1, state2)` - path planning between states
+  - Numba JIT optimization for real-time performance
+- [ ] `mapping/cscg/tokenizer.py` - Observation tokenization:
+  - `EmbeddingTokenizer` class:
+    - `__init__(n_tokens, embedding_dim)` - k-means clustering setup
+    - `fit(embeddings)` - learn token clusters from CLIP embeddings
+    - `tokenize(embedding)` - map embedding to discrete token
+    - `add_observation(embedding)` - online cluster update
+  - Combines CLIP embedding + YOLO histogram for richer tokens
+- [ ] `mapping/cscg/cscg_world_model.py` - Integration with POMDP:
+  - `CSCGWorldModel` class:
+    - Wraps CHMM with POMDP interface
+    - `localize(obs, action, frame)` - returns LocalizationResult
+    - `get_clone_belief()` - soft belief over clone states
+    - `get_community_belief()` - room-level belief (graph modularity)
+    - Clone states → POMDP locations
+    - T matrix → B matrix (transitions)
+    - E matrix → A matrix (observations)
 
-**Integration with POMDP:**
-- CSCG clone states replace TopologicalMap locations
-- Room communities provide hierarchical belief layer
-- POMDP A/B matrices derived from learned CSCG structure
+**Integration Points:**
+- Replace `TopologicalMap` location matching with CSCG clone inference
+- CSCG T matrix provides learned transition dynamics
+- Clone states disambiguate perceptually similar locations
 
-**Key Benefits:**
-- Handles "two hallways look the same" via clone disambiguation
-- Automatic room hierarchy via graph modularity
-- Better localization in ambiguous environments
+### Phase 10b: VBGS Local Place Models
 
-### Phase 11: Pose Estimation (Required for VBGS)
+**Reference:** `vbgs/` folder (already in project)
 
-**Goal:** Provide camera pose estimates for VBGS mapping.
-
-**Options (choose one):**
-1. **AprilTags** (recommended for indoor):
-   - Place tags in each room
-   - Fast, reliable localization
-   - Works with existing camera
-2. **Monocular Visual Odometry**:
-   - Optical flow + heuristics
-   - More drift, but no infrastructure needed
-3. **Hybrid**: VO + occasional tag correction
-
-**Files to Create:**
-- [ ] `pose/apriltag_localizer.py` (if using AprilTags)
-- [ ] `pose/visual_odometry.py` (if using VO)
-- [ ] `pose/__init__.py`
-
-### Phase 12: VBGS Mapping Backend (Variational Bayes Gaussian Splatting)
-
-**Goal:** Add continuous 3D mapper that improves localization priors and provides geometry.
-
-**Reference:** [VBGS repository](https://github.com/hmishfaq/VBGS)
-
-**Important Constraint:** VBGS requires separate environment due to JAX + Torch CUDA conflicts. Run as separate process.
-
-**Architecture:**
-```
-Process A (real-time control):          Process B (VBGS mapper):
-  - FrameGrabber                          - Receives frames + poses
-  - YOLO detection                        - Runs VBGS updates
-  - Discrete POMDP                        - Publishes:
-  - RC control                              - Room/zone priors
-                      ←─ IPC ──→            - Place signatures
-                                            - Obstacle hints
-```
+**Core Concept:** Each "place" (observation token cluster) gets its own VBGS model
+- No global poses required - just local image consistency
+- VBGS ELBO indicates how well current frame fits place model
+- Gaussian components = sub-areas within place
 
 **Files to Create:**
-- [ ] `mapping/vbgs/__init__.py` - VBGS integration package
-- [ ] `mapping/vbgs/vbgs_runner.py` - Separate process runner
-- [ ] `mapping/vbgs/vbgs_bridge.py`:
-  - `VBGSBridge` class:
-    - `send_frame(rgb, timestamp, pose)` - send to mapper
-    - `recv_priors()` - get zone/room likelihoods
-  - IPC via sockets/shared memory
-- [ ] `mapping/vbgs/prior_fusion.py`:
-  - Fuse VBGS priors with POMDP beliefs
-  - Update A matrix likelihoods based on VBGS output
+- [ ] `mapping/vbgs_place/__init__.py` - VBGS place model package
+- [ ] `mapping/vbgs_place/place_model.py`:
+  - `VBGSPlaceModel` class:
+    - `__init__(n_components)` - initialize Gaussian mixture
+    - `update(frame)` - continual learning from keyframe
+    - `compute_elbo(frame)` - how well does frame fit this place?
+    - `get_expected_view(shape)` - render expected appearance
+    - `get_subarea_assignments()` - which Gaussian component dominates?
+  - Uses `vbgs.model.train.fit_delta_gmm_step` for online updates
+  - Accumulates sufficient statistics across keyframes
+- [ ] `mapping/vbgs_place/keyframe_selector.py`:
+  - `KeyframeSelector` class:
+    - `should_add_keyframe(frame, embedding)` - viewpoint change detection
+    - Uses embedding distance + frame difference
+    - Rate limiting (max N keyframes per second)
+- [ ] `mapping/vbgs_place/place_manager.py`:
+  - `PlaceManager` class:
+    - `places: Dict[int, VBGSPlaceModel]` - one VBGS per token/clone
+    - `update_place(place_id, frame)` - add keyframe to place model
+    - `compute_place_evidence(frame)` - ELBO for all places
+    - `get_best_place(frame)` - argmax ELBO
 
-**VBGS Contributions:**
-- Geometry-consistent 3D map
-- Place signature / keyframe-id tokens
-- Zone priors for POMDP likelihood
-- Obstacle / layout hints
+**Integration Points:**
+- VBGS ELBO provides additional evidence for CSCG inference
+- Sub-area Gaussians enable finer localization within places
+- Expected view rendering for debugging/visualization
 
-### Phase 13: Unified Hierarchical Controller
-
-**Goal:** Combine CSCG + POMDP + VBGS into full hierarchical system.
-
-**Control Loop:**
-```
-Low-level (fast, every frame):
-  1. YOLO detection → token
-  2. CSCG inference → clone-state belief
-  3. VBGS update (async, best-effort)
-  4. Low-level POMDP → movement primitive
-
-High-level (slower, on room transitions):
-  1. Community detection → room belief
-  2. High-level POMDP → target room
-  3. Set subgoal for low-level
-```
+### Phase 10c: Unified Integration
 
 **Files to Modify:**
-- [ ] `person_hunter_pomdp.py` - Add hierarchical control mode
-- [ ] `pomdp/world_model.py` - Option to use CSCG backend
+- [ ] `pomdp/world_model.py` - Add CSCG+VBGS backend option:
+  - `WorldModel.__init__(backend='topological'|'cscg')` - backend selection
+  - CSCG backend uses `CSCGWorldModel` internally
+  - VBGS evidence fused into localization likelihood
+- [ ] `person_hunter_pomdp.py` - Use unified system:
+  - `POMDPController` uses CSCG world model
+  - Visualization shows clone states + VBGS evidence
+  - Keyframe collection during exploration
+
+**Unified Localization Flow:**
+```python
+def localize(self, obs, action, frame):
+    # 1. Extract CLIP embedding
+    embedding = self.image_encoder.encode(frame)
+
+    # 2. Tokenize to discrete observation
+    token = self.tokenizer.tokenize(embedding)
+
+    # 3. CSCG clone state inference
+    clone_belief = self.chmm.forward(token, action)
+
+    # 4. VBGS place evidence (optional, for high-confidence frames)
+    if self.use_vbgs:
+        vbgs_evidence = self.place_manager.compute_place_evidence(frame)
+        clone_belief = self.fuse_evidence(clone_belief, vbgs_evidence)
+
+    # 5. Update keyframe if viewpoint changed
+    if self.keyframe_selector.should_add_keyframe(frame, embedding):
+        place_id = clone_belief.argmax()
+        self.place_manager.update_place(place_id, frame)
+
+    # 6. Return POMDP-compatible result
+    return LocalizationResult(
+        belief=clone_belief,
+        location_id=clone_belief.argmax(),
+        vfe=self.compute_vfe(clone_belief, token),
+        ...
+    )
+```
+
+### Phase 10d: Testing & Validation
+
+- [ ] Test CSCG learning on recorded exploration sequences
+- [ ] Test VBGS place models with stationary drone views
+- [ ] Test integrated system with ground test mode
+- [ ] Compare localization accuracy: TopologicalMap vs CSCG+VBGS
+- [ ] Verify clone disambiguation in similar-looking areas
+
+### Key Benefits
+
+| Feature | TopologicalMap (current) | CSCG+VBGS (new) |
+|---------|-------------------------|-----------------|
+| Perceptual aliasing | ✗ Fails | ✓ Clone states disambiguate |
+| Graph structure | Manual edges | ✓ Learned from experience |
+| Place appearance | CLIP embedding only | ✓ CLIP + VBGS local model |
+| Sub-area localization | ✗ None | ✓ VBGS Gaussian components |
+| VFE computation | Sparse A matrix | ✓ VBGS ELBO (dense) |
+| Room hierarchy | ✗ None | ✓ Graph community detection |
+
+---
+
+## Next Steps (Priority Order)
+
+### Immediate: Real-World Testing
+1. **Test ORB place recognition with real video/webcam**
+   - Real environments have natural texture that ORB excels at
+   - Record exploration video, test place recognition offline
+   - Compare accuracy vs synthetic simulator
+
+2. **Integrate motion cues**
+   - Track optical flow between frames
+   - Use action history to condition place recognition
+   - CSCG benefits from (action, observation) sequences
+
+### Short-term: Enhanced Place Recognition
+
+3. **Object-centric spatial layouts**
+   - Enhance YOLO encoding: `{object: position, distance}`
+   - Spatial layout more stable than raw detection histograms
+
+4. **Visual odometry integration**
+   - Even rough VO helps: "moved forward", "rotated left"
+   - Stabilizes place matching during motion
+
+### Medium-term: Full Stack Integration
+
+5. **CSCG with real observations**
+   - Clone-structured HMM resolves perceptual aliasing
+   - Learns transition structure from exploration
+
+6. **VBGS local place models**
+   - Each keyframe cluster gets local Gaussian model
+   - ELBO provides place evidence
+
+---
+
+## Future Phases
+
+### Phase 11: Visual Odometry
+
+- [ ] Add lightweight VO (optical flow + essential matrix)
+- [ ] Estimate relative pose between frames
+- [ ] Feed motion cues into CSCG transition learning
+- [ ] No global SLAM needed - local consistency sufficient
+
+### Phase 12: Room Hierarchy via Community Detection
+
+- [ ] Run graph community detection on learned CSCG structure
+- [ ] Communities = room-level abstractions
+- [ ] High-level POMDP for room-to-room navigation
+
+### Phase 13: Full Hierarchical Controller
+
+```
+High-level (room policy):
+  - "Go to kitchen to find human"
+  - Uses room community beliefs
+
+Mid-level (place navigation):
+  - "Navigate through clone states to reach kitchen"
+  - Uses CSCG graph for path planning (bridge())
+
+Low-level (motor control):
+  - "Execute approach action"
+  - Uses InteractionMode POMDP
+```
 
 ---
 

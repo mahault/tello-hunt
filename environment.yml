@@ -13,6 +13,8 @@ dependencies:
     - keyboard
     - jax[cuda12]
     - transformers>=4.30.0  # For CLIP image embeddings
+    - numba  # For CSCG JIT optimization
+    - scikit-learn  # For k-means in tokenizer
     - --extra-index-url https://download.pytorch.org/whl/cu124
     - torch
     - torchvision
