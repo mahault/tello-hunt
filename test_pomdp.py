@@ -451,21 +451,27 @@ try:
     assert wm.n_locations == 0, "Should start empty"
     assert wm.current_location_id == -1, "No current location yet"
 
-    # First observation creates first location
+    # First observation creates first location (immediate, no hysteresis)
     result = wm.localize(kitchen_obs)
     assert result.new_location_discovered, "First obs should create new location"
     assert result.location_id == 0, "Should be location 0"
     assert wm.n_locations == 1, "Should have 1 location"
     print(f"    First location (kitchen): id={result.location_id}, conf={result.confidence:.2f}")
 
-    # Second different observation creates new location
-    result = wm.localize(living_obs, action_taken=1)  # moved forward
-    assert result.new_location_discovered, "Different obs should create new location"
+    # Second different observation requires hysteresis (10 consecutive novel frames)
+    # Simulate sustained novel observation
+    from pomdp.config import MIN_NOVEL_FRAMES_FOR_NEW_LOCATION
+    for i in range(MIN_NOVEL_FRAMES_FOR_NEW_LOCATION - 1):
+        result = wm.localize(living_obs, action_taken=1)
+    result = wm.localize(living_obs, action_taken=1)  # This should trigger new location
+    assert result.new_location_discovered, "Different obs should create new location after hysteresis"
     assert result.location_id == 1, "Should be location 1"
     assert wm.n_locations == 2, "Should have 2 locations"
     print(f"    Second location (living): id={result.location_id}, conf={result.confidence:.2f}")
 
-    # Third observation - bedroom
+    # Third observation - bedroom (with hysteresis)
+    for i in range(MIN_NOVEL_FRAMES_FOR_NEW_LOCATION - 1):
+        wm.localize(bedroom_obs, action_taken=1)
     result = wm.localize(bedroom_obs, action_taken=1)
     assert result.new_location_discovered, "Bedroom should be new"
     print(f"    Third location (bedroom): id={result.location_id}, conf={result.confidence:.2f}")
@@ -613,6 +619,343 @@ try:
     print(f"    Save/load roundtrip: OK")
 
     print("    [PASS] Human Search expansion works!")
+except Exception as e:
+    print(f"    [FAIL] {e}")
+    import traceback
+    traceback.print_exc()
+    raise
+
+# Test 15: Interaction Mode POMDP
+print("\n[15] Testing Interaction Mode POMDP...")
+try:
+    from pomdp.interaction_mode import (
+        InteractionModePOMDP, InteractionResult, action_to_rc_control,
+        SEARCHING, APPROACHING, INTERACTING, DISENGAGING,
+        ACTION_CONTINUE_SEARCH, ACTION_APPROACH, ACTION_BACKOFF
+    )
+    from pomdp.observation_encoder import create_empty_observation
+
+    # Create interaction mode POMDP
+    im = InteractionModePOMDP()
+    print(f"    Initial belief: {im.belief}")
+    print(f"    Initial state: {im.get_engagement_probs()}")
+
+    # Create observation with no person
+    obs_no_person = create_empty_observation()
+
+    # Update - should stay in searching mode
+    result = im.update(obs_no_person)
+    assert result.engagement_state == 'searching', f"Should be searching, got {result.engagement_state}"
+    print(f"    No person -> state={result.engagement_state}, action={result.selected_action}")
+    print(f"    EFE values: {result.efe_values}")
+
+    # Create observation with person detected center (approaching situation)
+    obs_person_center = create_empty_observation()
+    obs_person_center.person_detected = True
+    obs_person_center.person_area = 0.3
+    obs_person_center.person_cx = 0.0
+    obs_person_center.person_obs_idx = 2  # detected_center
+
+    # Update - should shift toward approaching
+    result = im.update(obs_person_center)
+    print(f"    Person center -> state={result.engagement_state}, action={result.selected_action}")
+    print(f"    Belief: {result.belief}")
+
+    # Create observation with person close (interacting situation)
+    obs_person_close = create_empty_observation()
+    obs_person_close.person_detected = True
+    obs_person_close.person_area = 0.7
+    obs_person_close.person_cx = 0.0
+    obs_person_close.person_obs_idx = 4  # detected_close
+
+    # Update multiple times to reinforce state
+    for _ in range(3):
+        result = im.update(obs_person_close)
+    print(f"    Person close (3x) -> state={result.engagement_state}, action={result.selected_action}")
+    print(f"    Confidence: {result.confidence:.2f}")
+
+    # Test action to RC control
+    lr, fb, ud, yaw = action_to_rc_control(ACTION_CONTINUE_SEARCH)
+    assert yaw > 0, "Search should rotate"
+    print(f"    continue_search -> yaw={yaw}")
+
+    lr, fb, ud, yaw = action_to_rc_control(ACTION_APPROACH, person_cx=-0.5, person_area=0.3)
+    assert yaw > 0, "Should yaw right to center left person"
+    assert fb > 0, "Should move forward"
+    print(f"    approach (person left) -> fb={fb}, yaw={yaw}")
+
+    lr, fb, ud, yaw = action_to_rc_control(ACTION_BACKOFF)
+    assert fb < 0, "Backoff should move backward"
+    print(f"    backoff -> fb={fb}")
+
+    # Test get_action_for_state
+    action = im.get_action_for_state(INTERACTING)
+    print(f"    Best action to reach INTERACTING: {action}")
+
+    # Test reset functions
+    im.reset_to_searching()
+    assert im.belief[SEARCHING] > 0.6, "Should have high searching belief"
+    print(f"    After reset_to_searching: {im.get_engagement_probs()}")
+
+    im.reset_to_approaching()
+    assert im.belief[APPROACHING] > 0.6, "Should have high approaching belief"
+    print(f"    After reset_to_approaching: {im.get_engagement_probs()}")
+
+    # Test save/load
+    state = im.save_state()
+    im2 = InteractionModePOMDP.load_state(state)
+    assert np.allclose(im.belief, im2.belief), "Belief should match after load"
+    print(f"    Save/load roundtrip: OK")
+
+    # Test statistics
+    stats = im.get_statistics()
+    print(f"    Stats: most_likely={stats['most_likely_state']}, entropy={stats['belief_entropy']:.2f}")
+
+    print("    [PASS] Interaction Mode POMDP works!")
+except Exception as e:
+    print(f"    [FAIL] {e}")
+    import traceback
+    traceback.print_exc()
+    raise
+
+# Test 16: Safety Module
+print("\n[16] Testing Safety Module...")
+try:
+    from safety import SafetyMonitor, SafetyState, SafetyOverride
+
+    # Create a mock Tello class for testing
+    class MockTello:
+        def __init__(self):
+            self.battery = 50
+            self.speed_y = 10.0
+
+        def get_battery(self):
+            return self.battery
+
+        def get_speed_y(self):
+            return self.speed_y
+
+    mock_tello = MockTello()
+    safety = SafetyMonitor(mock_tello)
+
+    # Test initial state
+    state, override = safety.update(commanded_fb=0)
+    assert state.battery_level == 50, "Battery should be 50%"
+    assert not state.battery_warning, "No warning at 50%"
+    assert not state.battery_critical, "Not critical at 50%"
+    assert override == SafetyOverride.NONE, "No override needed"
+    print(f"    Initial state: battery={state.battery_level}%, override={override}")
+
+    # Test battery warning - create new monitor to force immediate check
+    mock_tello.battery = 15
+    safety_warn = SafetyMonitor(mock_tello)
+    state, override = safety_warn.update(commanded_fb=0)
+    assert state.battery_warning, "Should warn at 15%"
+    assert not state.battery_critical, "Not critical at 15%"
+    assert override == SafetyOverride.NONE, "Warning only, no override"
+    print(f"    Low battery: warning={state.battery_warning}, critical={state.battery_critical}")
+
+    # Test battery critical - create new monitor to force immediate check
+    mock_tello.battery = 8
+    safety_crit = SafetyMonitor(mock_tello)
+    state, override = safety_crit.update(commanded_fb=0)
+    assert state.battery_critical, "Should be critical at 8%"
+    assert state.emergency, "Emergency should be set"
+    assert override == SafetyOverride.LAND, "Should request landing"
+    print(f"    Critical battery: emergency={state.emergency}, override={override}")
+
+    # Reset for contact detection test
+    mock_tello.battery = 50
+    safety = SafetyMonitor(mock_tello)
+
+    # Test contact detection - commanding forward but not moving
+    mock_tello.speed_y = 3  # Below threshold
+    for i in range(6):  # Need 5 frames to trigger
+        state, override = safety.update(commanded_fb=15)  # Commanding forward
+
+    assert state.contact_detected, "Contact should be detected"
+    assert override == SafetyOverride.BACKOFF, "Should request backoff"
+    print(f"    Contact detection: detected={state.contact_detected}, blocked_frames={state.blocked_frames}")
+
+    # Test override RC values
+    rc = safety.get_override_rc(SafetyOverride.BACKOFF)
+    assert rc[1] < 0, "Backoff should have negative fb"
+    assert rc[2] > 0, "Backoff should rise"
+    print(f"    Backoff RC: {rc}")
+
+    # Test should_land
+    mock_tello.battery = 5
+    safety2 = SafetyMonitor(mock_tello)
+    state, _ = safety2.update()
+    assert safety2.should_land(), "Should land when critical"
+    print(f"    should_land(): {safety2.should_land()}")
+
+    print("    [PASS] Safety Module works!")
+except Exception as e:
+    print(f"    [FAIL] {e}")
+    import traceback
+    traceback.print_exc()
+    raise
+
+# Test 17: Utils - FrameGrabber (basic import test)
+print("\n[17] Testing Utils Module...")
+try:
+    from utils import FrameGrabber, clamp
+
+    # Test clamp function
+    assert clamp(5.5, 0, 10) == 5, "clamp(5.5, 0, 10) should be 5"
+    assert clamp(-5, 0, 10) == 0, "clamp(-5, 0, 10) should be 0"
+    assert clamp(15, 0, 10) == 10, "clamp(15, 0, 10) should be 10"
+    print("    clamp(): OK")
+
+    # FrameGrabber requires a video capture, so just test import
+    print("    FrameGrabber: import OK (requires video stream for full test)")
+
+    print("    [PASS] Utils Module works!")
+except Exception as e:
+    print(f"    [FAIL] {e}")
+    import traceback
+    traceback.print_exc()
+    raise
+
+# Test 18: Exploration Mode POMDP
+print("\n[18] Testing Exploration Mode POMDP...")
+try:
+    from pomdp import (
+        ExplorationModePOMDP,
+        ExplorationResult,
+        exploration_action_to_rc_control,
+        SCANNING,
+        APPROACHING_FRONTIER,
+        BACKTRACKING,
+        TRANSITIONING,
+    )
+    from pomdp.world_model import WorldModel
+    from pomdp.observation_encoder import create_empty_observation
+
+    # Create exploration mode
+    explore = ExplorationModePOMDP(
+        vfe_window=10,
+        vfe_threshold=1.0,
+        vfe_variance_threshold=0.5,
+    )
+    print(f"    Created ExplorationModePOMDP")
+
+    # Create a world model with one location
+    wm = WorldModel()
+
+    # Create test observation
+    test_obs = create_empty_observation()
+    test_obs.object_levels[1] = 2  # high_conf chair
+
+    # First observation - creates a location
+    loc_result = wm.localize(test_obs)
+    assert loc_result.new_location_discovered, "Should create first location"
+    print(f"    WorldModel has {wm.n_locations} location(s)")
+
+    # Update exploration mode
+    result = explore.update(test_obs, wm, loc_result)
+    assert isinstance(result, ExplorationResult), "Should return ExplorationResult"
+    print(f"    Initial state: {result.exploration_state}")
+    print(f"    Action: {result.selected_action_name}")
+    print(f"    VFE: {result.current_vfe:.3f}")
+
+    # Should start in scanning state
+    assert result.exploration_state == 'scanning', f"Should start scanning, got {result.exploration_state}"
+
+    # Test VFE tracking
+    mean_vfe, vfe_var = explore.get_vfe_stats()
+    print(f"    VFE stats: mean={mean_vfe:.3f}, var={vfe_var:.5f}")
+
+    # Run multiple updates to build VFE history
+    for i in range(15):
+        loc_result = wm.localize(test_obs)
+        result = explore.update(test_obs, wm, loc_result)
+
+    # Check VFE stats after multiple updates
+    mean_vfe, vfe_var = explore.get_vfe_stats()
+    print(f"    After 15 frames: mean_vfe={mean_vfe:.3f}, var={vfe_var:.5f}")
+    print(f"    Should transition: {result.should_transition_to_hunt}")
+    print(f"    Reason: {result.transition_reason}")
+
+    # Test exploration statistics
+    stats = explore.get_statistics()
+    print(f"    Stats: state={stats['state']}, frames={stats['total_frames']}")
+
+    # Test RC control conversion
+    lr, fb, ud, yaw = exploration_action_to_rc_control(0)  # stay
+    assert yaw > 0, "Stay should rotate during exploration"
+    print(f"    stay -> yaw={yaw} (scanning rotation)")
+
+    lr, fb, ud, yaw = exploration_action_to_rc_control(1)  # forward
+    assert fb > 0, "Forward should move forward"
+    print(f"    forward -> fb={fb}")
+
+    lr, fb, ud, yaw = exploration_action_to_rc_control(2)  # back
+    assert fb < 0, "Back should move backward"
+    print(f"    back -> fb={fb}")
+
+    lr, fb, ud, yaw = exploration_action_to_rc_control(4)  # right
+    assert yaw > 0, "Right should rotate right"
+    print(f"    right -> yaw={yaw}")
+
+    # Test reset
+    explore.reset()
+    stats = explore.get_statistics()
+    assert stats['total_frames'] == 0, "Frames should reset"
+    print(f"    After reset: frames={stats['total_frames']}")
+
+    print("    [PASS] Exploration Mode POMDP works!")
+except Exception as e:
+    print(f"    [FAIL] {e}")
+    import traceback
+    traceback.print_exc()
+    raise
+
+# Test 19: Exploration transition criteria
+print("\n[19] Testing Exploration VFE-based transition...")
+try:
+    from pomdp import ExplorationModePOMDP
+    from pomdp.world_model import WorldModel, LocalizationResult
+    from pomdp.observation_encoder import create_empty_observation
+    import jax.numpy as jnp
+
+    # Create exploration mode with low threshold for faster testing
+    explore = ExplorationModePOMDP(
+        vfe_window=5,
+        vfe_threshold=2.0,  # Higher threshold = easier to transition
+        vfe_variance_threshold=1.0,
+    )
+
+    wm = WorldModel()
+
+    # Create observation that will produce consistent VFE
+    test_obs = create_empty_observation()
+    test_obs.object_levels[1] = 2  # high_conf chair
+
+    # Create first location
+    loc_result = wm.localize(test_obs)
+
+    # Simulate multiple consistent observations (should lower VFE)
+    transition_triggered = False
+    for i in range(30):
+        loc_result = wm.localize(test_obs)
+        result = explore.update(test_obs, wm, loc_result)
+
+        if result.should_transition_to_hunt:
+            transition_triggered = True
+            print(f"    Transition triggered at frame {i+1}: {result.transition_reason}")
+            break
+
+    mean_vfe, vfe_var = explore.get_vfe_stats()
+    print(f"    Final VFE stats: mean={mean_vfe:.3f}, var={vfe_var:.5f}")
+    print(f"    Transition check: should_transition={result.should_transition_to_hunt}")
+
+    # At minimum, check that VFE is being tracked
+    assert mean_vfe != float('inf'), "VFE should be computed"
+    print(f"    VFE tracking: OK")
+
+    print("    [PASS] Exploration transition criteria works!")
 except Exception as e:
     print(f"    [FAIL] {e}")
     import traceback

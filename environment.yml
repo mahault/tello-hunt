@@ -1,5 +1,6 @@
 name: tello-hunt
 channels:
+  - pytorch
   - conda-forge
   - defaults
 dependencies:
@@ -10,6 +11,10 @@ dependencies:
     - djitellopy
     - ultralytics
     - keyboard
-    - jax
-    - jaxlib
+    - jax[cuda12]
+    - transformers>=4.30.0  # For CLIP image embeddings
+    - --extra-index-url https://download.pytorch.org/whl/cu124
+    - torch
+    - torchvision
+
 

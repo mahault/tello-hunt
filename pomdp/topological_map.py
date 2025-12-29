@@ -25,7 +25,7 @@ class LocationNode:
     A node in the topological map representing a distinct location.
 
     Locations are identified by their observation signatures (what objects
-    are visible from that location).
+    are visible from that location) and optionally by image embeddings.
     """
     # Unique identifier
     id: int
@@ -45,10 +45,17 @@ class LocationNode:
     # Running sum for online mean update
     _signature_sum: np.ndarray = field(default=None, repr=False)
 
+    # Image embedding for CLIP-based localization (optional)
+    # Shape: (512,) for CLIP ViT-B/32
+    image_embedding: np.ndarray = field(default=None)
+    _embedding_sum: np.ndarray = field(default=None, repr=False)
+
     def __post_init__(self):
         """Initialize derived fields."""
         if self._signature_sum is None:
             self._signature_sum = self.observation_signature.copy()
+        if self.image_embedding is not None and self._embedding_sum is None:
+            self._embedding_sum = self.image_embedding.copy()
 
     def update_signature(self, new_obs: np.ndarray):
         """
@@ -59,6 +66,23 @@ class LocationNode:
         self.visit_count += 1
         self._signature_sum = self._signature_sum + new_obs
         self.observation_signature = self._signature_sum / self.visit_count
+
+    def update_embedding(self, new_embedding: np.ndarray):
+        """
+        Update the image embedding with a new observation.
+
+        Uses online mean update with re-normalization.
+        """
+        if self.image_embedding is None:
+            self.image_embedding = new_embedding.copy()
+            self._embedding_sum = new_embedding.copy()
+        else:
+            self._embedding_sum = self._embedding_sum + new_embedding
+            self.image_embedding = self._embedding_sum / self.visit_count
+            # Re-normalize
+            norm = np.linalg.norm(self.image_embedding)
+            if norm > 0:
+                self.image_embedding = self.image_embedding / norm
 
     def update_A_counts(self, object_levels: np.ndarray):
         """
@@ -76,13 +100,17 @@ class LocationNode:
 
     def to_dict(self) -> Dict:
         """Serialize to dictionary for JSON persistence."""
-        return {
+        data = {
             'id': self.id,
             'observation_signature': self.observation_signature.tolist(),
             'A_counts': self.A_counts.tolist(),
             'visit_count': self.visit_count,
             '_signature_sum': self._signature_sum.tolist(),
         }
+        if self.image_embedding is not None:
+            data['image_embedding'] = self.image_embedding.tolist()
+            data['_embedding_sum'] = self._embedding_sum.tolist()
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'LocationNode':
@@ -94,6 +122,9 @@ class LocationNode:
             visit_count=data['visit_count'],
         )
         node._signature_sum = np.array(data['_signature_sum'], dtype=np.float32)
+        if 'image_embedding' in data:
+            node.image_embedding = np.array(data['image_embedding'], dtype=np.float32)
+            node._embedding_sum = np.array(data['_embedding_sum'], dtype=np.float32)
         return node
 
 
@@ -231,6 +262,74 @@ class TopologicalMap:
                 best_id = node.id
 
         return best_id, best_sim
+
+    def add_node_with_embedding(
+        self,
+        observation: ObservationToken,
+        embedding: np.ndarray
+    ) -> LocationNode:
+        """
+        Add a new location node with an image embedding.
+
+        Args:
+            observation: Current observation token
+            embedding: Image embedding from CLIP (512,)
+
+        Returns:
+            The newly created node
+        """
+        node = self.add_node(observation)
+        node.image_embedding = embedding.copy()
+        node._embedding_sum = embedding.copy()
+        return node
+
+    def find_best_match_embedding(
+        self,
+        embedding: np.ndarray
+    ) -> Tuple[int, float]:
+        """
+        Find the best matching location using image embeddings.
+
+        Args:
+            embedding: Query image embedding (512,)
+
+        Returns:
+            (node_id, similarity) if match found, (-1, 0.0) otherwise
+        """
+        if len(self.nodes) == 0:
+            return -1, 0.0
+
+        # Only consider nodes that have embeddings
+        nodes_with_embeddings = [n for n in self.nodes if n.image_embedding is not None]
+        if len(nodes_with_embeddings) == 0:
+            return -1, 0.0
+
+        best_id = -1
+        best_sim = 0.0
+
+        for node in nodes_with_embeddings:
+            # Cosine similarity (embeddings are normalized)
+            sim = float(np.dot(embedding, node.image_embedding))
+            if sim > best_sim:
+                best_sim = sim
+                best_id = node.id
+
+        return best_id, best_sim
+
+    def get_all_embeddings(self) -> Tuple[np.ndarray, List[int]]:
+        """
+        Get all node embeddings as a matrix.
+
+        Returns:
+            (embeddings, node_ids) where embeddings is (N, 512)
+        """
+        nodes_with_embeddings = [n for n in self.nodes if n.image_embedding is not None]
+        if len(nodes_with_embeddings) == 0:
+            return np.empty((0, 512)), []
+
+        embeddings = np.stack([n.image_embedding for n in nodes_with_embeddings])
+        node_ids = [n.id for n in nodes_with_embeddings]
+        return embeddings, node_ids
 
     def localize(
         self,

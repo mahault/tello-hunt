@@ -259,38 +259,251 @@ while running:
   - `HumanSearchResult` dataclass with belief diagnostics
   - Save/load via `save_state()` and `load_state()`
 
-### Phase 5: Interaction Mode POMDP
-- [ ] `pomdp/interaction_mode.py`:
-  - Engagement state transitions
-  - `get_interaction_obs()` (JIT)
-  - `update_interaction_belief()` (JIT)
-  - `select_interaction_action()` - EFE minimization
+### Phase 5: Interaction Mode POMDP ✓
+- [x] `pomdp/interaction_mode.py`:
+  - `InteractionModePOMDP` class - action selection via active inference
+  - State space: 4 engagement states (searching, approaching, interacting, disengaging)
+  - Action space: 6 actions (continue_search, approach, interact_led, interact_wiggle, backoff, land)
+  - Hand-designed A matrix: P(person_obs | engagement_state)
+  - Hand-designed B matrix: P(state' | state, action) - action effects on engagement
+  - C preferences: favor detecting people, especially close
+  - `update()` - belief update + EFE-based action selection
+  - `update_with_action_override()` - for safety overrides
+  - `get_action_for_state()` - best action to reach target state
+  - `action_to_rc_control()` - convert action to drone RC commands
+  - `InteractionResult` dataclass with belief, action, EFE diagnostics
+  - Save/load via `save_state()` and `load_state()`
 
-### Phase 6: Safety Module
-- [ ] `safety/overrides.py`:
-  - Battery checks
-  - Collision detection
-  - Emergency overrides
+### Phase 6: Safety Module ✓
+- [x] `safety/__init__.py` - Package exports
+- [x] `safety/overrides.py`:
+  - `SafetyState` dataclass: battery level, warning/critical flags, contact detection, emergency state
+  - `SafetyOverride` constants: NONE, BACKOFF, HOVER, LAND, EMERGENCY_LAND
+  - `SafetyMonitor` class:
+    - `__init__(tello)` - stores Tello reference
+    - `update(commanded_fb)` - main safety check, returns (SafetyState, override_code)
+    - `_check_battery()` - rate-limited battery query (every 5s)
+    - `_check_contact(commanded_fb)` - blocked movement detection (5 frames threshold)
+    - `get_override_rc(override)` - RC values for override actions
+    - `reset_contact()` - reset after backoff
+    - `should_land()` - check if landing required
+  - Battery thresholds: warn at 20%, critical at 10%
+  - Contact detection: speed < 5 cm/s while commanding forward for 5 frames
 
-### Phase 7: Integration
-- [ ] `utils/frame_grabber.py` - extract from person_hunter_safe.py
-- [ ] `person_hunter_pomdp.py` - full POMDP integration with learning
-  - Load existing map or start fresh
-  - Learn during flight
-  - Save map on landing
-- [ ] Visualization overlay with beliefs + learned locations
+### Phase 7: Integration ✓
+- [x] `utils/frame_grabber.py` - extracted from person_hunter_safe.py
+  - `FrameGrabber` class: threaded frame capture with lock
+  - `get_frame()` - returns thread-safe frame copy
+  - `clamp()` utility function
+- [x] `utils/__init__.py` - exports FrameGrabber, clamp
+- [x] `person_hunter_pomdp.py` - full POMDP integration script
+  - `POMDPController` class:
+    - `__init__(load_existing_map)` - initializes all 3 POMDPs
+    - `update(yolo_boxes, ...)` - full update cycle with safety override support
+    - `save_map(name)` - persist learned world model
+    - `get_diagnostics()` - status from all POMDPs
+  - Main loop structure:
+    1. Safety check FIRST (before POMDP)
+    2. YOLO detection
+    3. POMDP update cycle (WorldModel → HumanSearch → InteractionMode)
+    4. Execute RC control
+    5. Visualization overlay
+    6. Exit condition checks
+  - `draw_pomdp_overlay()` - visualization with:
+    - Battery indicator (color-coded)
+    - Location + confidence
+    - Engagement state + action
+    - Human belief bar
+    - Safety warnings (contact, low battery)
+    - RC control indicator
+  - Pre-flight warmup loop
+  - Graceful cleanup and map save on exit
 
-### Phase 8: Exploration Mode
-- [ ] Add dedicated exploration behavior:
-  - Systematic room scanning when map is sparse
-  - Prefer unexplored areas (information gain)
-  - Build map before hunting
+### Phase 8: Exploration Mode ✓
+- [x] `pomdp/exploration_mode.py`:
+  - `ExplorationModePOMDP` class - systematic environment mapping
+  - VFE-based transition criteria (not arbitrary thresholds)
+  - State machine: SCANNING, APPROACHING_FRONTIER, BACKTRACKING, TRANSITIONING
+  - `update(obs, world_model, loc_result)` - update exploration state
+  - `should_transition_to_hunt()` - VFE + variance based decision
+  - VFE tracking via sliding window for stability detection
+  - `get_vfe_stats()` - mean and variance for diagnostics
+  - `exploration_action_to_rc_control()` - faster rotation/movement for exploration
+  - `ExplorationResult` dataclass with VFE diagnostics
+- [x] Mode switching in `person_hunter_pomdp.py`:
+  - `POMDPController.mode` - "exploration" or "hunting"
+  - `set_mode(mode, lock)` - manual mode switching
+  - Automatic transition from exploration to hunting when VFE stabilizes
+  - Keyboard controls: E = exploration, H = hunting
+  - Mode-specific visualization overlay
+- [x] Config constants in `pomdp/config.py`:
+  - `EXPLORATION_VFE_WINDOW` - frames to track VFE history
+  - `EXPLORATION_VFE_THRESHOLD` - mean VFE below this = well-modeled
+  - `EXPLORATION_VFE_VARIANCE_THRESHOLD` - variance below this = stable
+  - `EXPLORATION_EPISTEMIC_WEIGHT`, `EXPLORATION_PRAGMATIC_WEIGHT`
+  - `EXPLORATION_SCAN_YAW`, `EXPLORATION_FORWARD_FB`
+  - `EXPLORATION_STATES`, `N_EXPLORATION_STATES`
 
-### Phase 9: Testing & Iteration
-- [ ] Test map learning with stationary drone + manual carry
+**Key insight:** VFE naturally captures "information gain" - when observations fit the model well (low VFE) and are stable (low variance), exploration is complete. This is more principled than arbitrary rotation counts or location thresholds.
+
+### Phase 9: Observation Encoding Improvements
+
+**Problem Discovered:** YOLO object detection histograms are too noisy for stable location signatures. Testing showed 32 locations created while rotating in a single room. Issues:
+- Objects appear/disappear at frame edges
+- Confidence scores fluctuate frame-to-frame
+- Different angles show different object subsets
+- Empty walls/floors create spurious "unique" signatures
+
+**Solution Options (in order of complexity):**
+
+#### Option A: Image Embeddings (Recommended First)
+Replace YOLO object signatures with pre-trained CNN image features.
+
+- [x] `pomdp/image_encoder.py`:
+  - `ImageEncoder` class using CLIP or ResNet
+  - `encode_frame(frame) -> np.ndarray` - extract embedding vector
+  - Cosine similarity on embeddings for location matching
+- [ ] Update `TopologicalMap` to store image embeddings
+- [ ] Update `WorldModel` to use embeddings for localization
+
+**Benefits:**
+- More stable than object detection histograms
+- Captures visual scene similarity better
+- CLIP understands semantic scene content
+- Quick to implement and test
+
+**Dependencies:**
+```yaml
+- pip:
+    - transformers>=4.30.0
+    - torch>=2.0.0
+```
+
+#### Option B: CSCG (Clone-Structured Cognitive Graphs)
+More principled solution for perceptual aliasing - see Phase 10.
+
+#### Option C: VBGS (3D Gaussian Splatting)
+Full 3D mapping with geometry - requires pose estimation first - see Phases 11-12.
+
+### Phase 9b: Testing & Iteration
+- [ ] Test image embedding localization with stationary drone
 - [ ] Test location inference accuracy
 - [ ] Flight testing with learning enabled
 - [ ] Verify map persistence across sessions
+
+---
+
+## Future: CSCG + VBGS Integration
+
+### Phase 10: CSCG Cognitive Map (Clone-Structured Cognitive Graphs)
+
+**Goal:** Replace simple topological map with CSCG for better perceptual aliasing handling and hierarchical room discovery.
+
+**Reference:** [vicariousinc/naturecomm_cscg](https://github.com/vicariousinc/naturecomm_cscg)
+
+**Architecture:**
+- CSCG learns a "cloned" hidden state space to resolve perceptual aliasing
+- Community detection on cloned graph reveals room-level hierarchy
+- Two time scales: low-level (clone states) and high-level (room communities)
+
+**Files to Create:**
+- [ ] `mapping/cscg/__init__.py` - CSCG package
+- [ ] `mapping/cscg/cscg_bridge.py`:
+  - `CSCGBridge` class:
+    - `__init__(num_tokens, num_actions, num_clones)`
+    - `update(action, token)` - online/mini-batch EM update
+    - `clone_belief(token)` - infer p(z|x)
+    - `communities()` - room-level clusters via community detection
+  - Convert observation tokens to CSCG alphabet
+  - Run community detection for hierarchy
+
+**Integration with POMDP:**
+- CSCG clone states replace TopologicalMap locations
+- Room communities provide hierarchical belief layer
+- POMDP A/B matrices derived from learned CSCG structure
+
+**Key Benefits:**
+- Handles "two hallways look the same" via clone disambiguation
+- Automatic room hierarchy via graph modularity
+- Better localization in ambiguous environments
+
+### Phase 11: Pose Estimation (Required for VBGS)
+
+**Goal:** Provide camera pose estimates for VBGS mapping.
+
+**Options (choose one):**
+1. **AprilTags** (recommended for indoor):
+   - Place tags in each room
+   - Fast, reliable localization
+   - Works with existing camera
+2. **Monocular Visual Odometry**:
+   - Optical flow + heuristics
+   - More drift, but no infrastructure needed
+3. **Hybrid**: VO + occasional tag correction
+
+**Files to Create:**
+- [ ] `pose/apriltag_localizer.py` (if using AprilTags)
+- [ ] `pose/visual_odometry.py` (if using VO)
+- [ ] `pose/__init__.py`
+
+### Phase 12: VBGS Mapping Backend (Variational Bayes Gaussian Splatting)
+
+**Goal:** Add continuous 3D mapper that improves localization priors and provides geometry.
+
+**Reference:** [VBGS repository](https://github.com/hmishfaq/VBGS)
+
+**Important Constraint:** VBGS requires separate environment due to JAX + Torch CUDA conflicts. Run as separate process.
+
+**Architecture:**
+```
+Process A (real-time control):          Process B (VBGS mapper):
+  - FrameGrabber                          - Receives frames + poses
+  - YOLO detection                        - Runs VBGS updates
+  - Discrete POMDP                        - Publishes:
+  - RC control                              - Room/zone priors
+                      ←─ IPC ──→            - Place signatures
+                                            - Obstacle hints
+```
+
+**Files to Create:**
+- [ ] `mapping/vbgs/__init__.py` - VBGS integration package
+- [ ] `mapping/vbgs/vbgs_runner.py` - Separate process runner
+- [ ] `mapping/vbgs/vbgs_bridge.py`:
+  - `VBGSBridge` class:
+    - `send_frame(rgb, timestamp, pose)` - send to mapper
+    - `recv_priors()` - get zone/room likelihoods
+  - IPC via sockets/shared memory
+- [ ] `mapping/vbgs/prior_fusion.py`:
+  - Fuse VBGS priors with POMDP beliefs
+  - Update A matrix likelihoods based on VBGS output
+
+**VBGS Contributions:**
+- Geometry-consistent 3D map
+- Place signature / keyframe-id tokens
+- Zone priors for POMDP likelihood
+- Obstacle / layout hints
+
+### Phase 13: Unified Hierarchical Controller
+
+**Goal:** Combine CSCG + POMDP + VBGS into full hierarchical system.
+
+**Control Loop:**
+```
+Low-level (fast, every frame):
+  1. YOLO detection → token
+  2. CSCG inference → clone-state belief
+  3. VBGS update (async, best-effort)
+  4. Low-level POMDP → movement primitive
+
+High-level (slower, on room transitions):
+  1. Community detection → room belief
+  2. High-level POMDP → target room
+  3. Set subgoal for low-level
+```
+
+**Files to Modify:**
+- [ ] `person_hunter_pomdp.py` - Add hierarchical control mode
+- [ ] `pomdp/world_model.py` - Option to use CSCG backend
 
 ---
 
@@ -303,29 +516,45 @@ Add to environment.yml:
     - jaxlib>=0.4.20
 ```
 
+For CSCG (Phase 10):
+```yaml
+- pip:
+    - networkx            # For community detection
+```
+
+For VBGS (Phase 12) - **separate environment**:
+```yaml
+# Create separate conda env: conda create -n vbgs python=3.10
+- pip:
+    - jax[cuda12]         # VBGS requires JAX with CUDA
+    - torch               # For rendering components
+```
+
 ---
 
 ## Files to Create
 
-| File | Purpose |
-|------|---------|
-| `pomdp/__init__.py` | Package init |
-| `pomdp/config.py` | Constants, thresholds, N_MAX_LOCATIONS |
-| `pomdp/core.py` | JAX JIT belief functions |
-| `pomdp/observation_encoder.py` | YOLO → fixed observation tokens |
-| `pomdp/topological_map.py` | TopologicalMap class, LocationNode |
-| `pomdp/similarity.py` | Observation similarity for localization |
-| `pomdp/map_persistence.py` | Save/load learned environment maps |
-| `pomdp/world_model.py` | Location belief POMDP + learning |
-| `pomdp/human_search.py` | Human location POMDP |
-| `pomdp/interaction_mode.py` | Action selection POMDP |
-| `pomdp/priors.py` | Context-based priors |
-| `safety/__init__.py` | Package init |
-| `safety/overrides.py` | Safety checks |
-| `utils/__init__.py` | Package init |
-| `utils/frame_grabber.py` | Extract from existing |
-| `maps/` | Directory for saved learned maps |
-| `person_hunter_pomdp.py` | New main script with learning |
+| File | Purpose | Phase |
+|------|---------|-------|
+| `pomdp/__init__.py` | Package init | 1 ✓ |
+| `pomdp/config.py` | Constants, thresholds | 1 ✓ |
+| `pomdp/core.py` | JAX JIT belief functions | 1 ✓ |
+| `pomdp/observation_encoder.py` | YOLO → fixed tokens | 1 ✓ |
+| `pomdp/topological_map.py` | TopologicalMap class | 2 ✓ |
+| `pomdp/similarity.py` | Observation similarity | 2 ✓ |
+| `pomdp/map_persistence.py` | Save/load maps | 2 ✓ |
+| `pomdp/world_model.py` | Location belief POMDP | 3 ✓ |
+| `pomdp/human_search.py` | Human location POMDP | 4 ✓ |
+| `pomdp/interaction_mode.py` | Action selection POMDP | 5 ✓ |
+| `safety/__init__.py` | Package init | 6 ✓ |
+| `safety/overrides.py` | Safety checks | 6 ✓ |
+| `utils/__init__.py` | Package init | 7 ✓ |
+| `utils/frame_grabber.py` | Threaded frame grabber | 7 ✓ |
+| `person_hunter_pomdp.py` | Main integration script | 7 ✓ |
+| `pomdp/exploration_mode.py` | Exploration mode POMDP | 8 ✓ |
+| `mapping/cscg/` | CSCG cognitive maps | 10 |
+| `pose/` | Pose estimation | 11 |
+| `mapping/vbgs/` | VBGS integration | 12 |
 
 ## Files to Modify
 
@@ -337,7 +566,7 @@ Add to environment.yml:
 
 | File | Why |
 |------|-----|
-| `person_hunter_safe.py` | Reference for main loop (lines 216-402), YOLO integration, RC control |
+| `person_hunter_safe.py` | Reference for main loop, YOLO integration, RC control |
 
 ---
 
@@ -350,3 +579,7 @@ Add to environment.yml:
 - [pymdp: A Python library for active inference](https://github.com/infer-actively/pymdp) - Reference implementation for discrete POMDP active inference.
 
 - [Robot navigation as hierarchical active inference](https://www.sciencedirect.com/science/article/abs/pii/S0893608021002021) - Hierarchical structure for navigation.
+
+- [Clone-Structured Cognitive Graphs (CSCG)](https://github.com/vicariousinc/naturecomm_cscg) - Vicarious Inc. Learning cognitive maps that resolve perceptual aliasing via clone splitting, with hierarchical abstraction via community detection.
+
+- [Variational Bayes Gaussian Splatting (VBGS)](https://github.com/hmishfaq/VBGS) - Continual 3D mapping via variational inference on Gaussian splats. Suitable for streaming drone video.

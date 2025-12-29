@@ -13,7 +13,11 @@ N_MAX_LOCATIONS = 50
 
 # Similarity threshold for localization (cosine similarity)
 # Above this = same location, below = new location
-LOCATION_SIMILARITY_THRESHOLD = 0.7
+LOCATION_SIMILARITY_THRESHOLD = 0.5  # Lowered from 0.7 for more tolerance
+
+# Minimum consecutive novel frames before creating new location
+# Prevents spurious locations from YOLO detection noise
+MIN_NOVEL_FRAMES_FOR_NEW_LOCATION = 10
 
 # Minimum observations before a location is considered "established"
 MIN_VISITS_FOR_ESTABLISHED = 3
@@ -159,3 +163,25 @@ VFE_HIGH_THRESHOLD = 3.0
 # VFE threshold for confident localization
 # Low VFE = good model fit, confident about location
 VFE_LOW_THRESHOLD = 1.0
+
+# =============================================================================
+# Exploration Mode Parameters
+# =============================================================================
+
+# VFE-based transition thresholds (proper VFE = Complexity - Accuracy)
+# With CLIP embeddings: VFE ≈ 0.1-0.5 when well-modeled, 1-3+ when novel
+EXPLORATION_VFE_WINDOW = 30           # Frames to track VFE history
+EXPLORATION_VFE_THRESHOLD = 1.0       # Mean VFE below this = well-modeled
+EXPLORATION_VFE_VARIANCE_THRESHOLD = 0.3  # Variance below this = stable
+
+# EFE weights during exploration (epistemic-heavy)
+EXPLORATION_EPISTEMIC_WEIGHT = 2.0    # Higher = more curiosity
+EXPLORATION_PRAGMATIC_WEIGHT = 0.5    # Lower = less goal-focused
+
+# RC control parameters for exploration
+EXPLORATION_SCAN_YAW = 40             # Rotation speed during scanning
+EXPLORATION_FORWARD_FB = 25           # Forward speed to frontiers
+
+# Exploration states
+EXPLORATION_STATES = ['scanning', 'approaching_frontier', 'backtracking', 'transitioning']
+N_EXPLORATION_STATES = 4

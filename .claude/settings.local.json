@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebSearch"
+      "WebSearch",
+      "WebFetch(domain:www.sciencedirect.com)",
+      "Bash(nvidia-smi:*)"
     ]
   }
 }

@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from .config import (
     N_MAX_LOCATIONS, N_OBJECT_TYPES, N_OBS_LEVELS, N_MOVEMENT_ACTIONS,
     LOCATION_SIMILARITY_THRESHOLD, NOVELTY_SURPRISAL_THRESHOLD,
-    VFE_HIGH_THRESHOLD, VFE_LOW_THRESHOLD, DIRICHLET_PRIOR_ALPHA
+    VFE_HIGH_THRESHOLD, VFE_LOW_THRESHOLD, DIRICHLET_PRIOR_ALPHA,
+    MIN_NOVEL_FRAMES_FOR_NEW_LOCATION,
 )
 from .topological_map import TopologicalMap, LocationNode
 from .observation_encoder import ObservationToken
@@ -72,7 +73,8 @@ class WorldModel:
         self,
         topo_map: TopologicalMap = None,
         novelty_threshold: float = NOVELTY_SURPRISAL_THRESHOLD,
-        similarity_threshold: float = LOCATION_SIMILARITY_THRESHOLD
+        similarity_threshold: float = LOCATION_SIMILARITY_THRESHOLD,
+        use_image_embeddings: bool = True,
     ):
         """
         Initialize world model.
@@ -81,10 +83,12 @@ class WorldModel:
             topo_map: Existing topological map (or None for fresh start)
             novelty_threshold: Surprisal threshold for new location detection
             similarity_threshold: Cosine similarity threshold for localization
+            use_image_embeddings: Use CLIP image embeddings instead of YOLO signatures
         """
         self.topo_map = topo_map if topo_map is not None else TopologicalMap()
         self.novelty_threshold = novelty_threshold
         self.similarity_threshold = similarity_threshold
+        self.use_image_embeddings = use_image_embeddings
 
         # Current belief over locations (uniform if map exists, else empty)
         self._belief: Optional[jnp.ndarray] = None
@@ -97,7 +101,14 @@ class WorldModel:
         # Cached matrices for JIT efficiency
         self._A_cache: Optional[jnp.ndarray] = None
         self._B_cache: Optional[jnp.ndarray] = None
+
+        # Hysteresis for new location detection
+        self._consecutive_novel_frames: int = 0
+        self._pending_novel_obs: Optional[ObservationToken] = None
         self._cache_valid: bool = False
+
+        # Image encoder for CLIP embeddings (lazy loaded)
+        self._image_encoder = None
 
     def _init_belief(self):
         """Initialize belief distribution."""
@@ -143,10 +154,18 @@ class WorldModel:
             return 0.0
         return float(jnp.max(self._belief))
 
+    def _get_image_encoder(self):
+        """Get or create the image encoder (lazy loading)."""
+        if self._image_encoder is None:
+            from .image_encoder import ImageEncoder
+            self._image_encoder = ImageEncoder()
+        return self._image_encoder
+
     def localize(
         self,
         observation: ObservationToken,
-        action_taken: int = 0
+        action_taken: int = 0,
+        frame: np.ndarray = None,
     ) -> LocalizationResult:
         """
         Update location belief based on new observation.
@@ -156,15 +175,25 @@ class WorldModel:
         Args:
             observation: Current YOLO observation token
             action_taken: Movement action taken since last observation (0=stay)
+            frame: Optional BGR image frame for CLIP embedding extraction
 
         Returns:
             LocalizationResult with updated belief and diagnostics
         """
         obs_signature = observation.to_signature_vector()
 
+        # Extract image embedding if using embeddings and frame provided
+        current_embedding = None
+        if self.use_image_embeddings and frame is not None:
+            encoder = self._get_image_encoder()
+            current_embedding = encoder.encode(frame)
+
         # Case 1: No locations yet - create first one
         if self.n_locations == 0:
-            node = self.topo_map.add_node(observation)
+            if current_embedding is not None:
+                node = self.topo_map.add_node_with_embedding(observation, current_embedding)
+            else:
+                node = self.topo_map.add_node(observation)
             self._belief = jnp.ones(1)
             self._invalidate_cache()
 
@@ -189,32 +218,86 @@ class WorldModel:
                 self._belief = normalize(self._belief)
 
         # Check similarity to existing locations
-        best_id, best_sim = self.topo_map.find_best_match(observation)
+        # Use image embeddings if available, otherwise fall back to YOLO signatures
+        if current_embedding is not None:
+            best_id, best_sim = self.topo_map.find_best_match_embedding(current_embedding)
+        else:
+            best_id, best_sim = self.topo_map.find_best_match(observation)
 
-        # Compute VFE to detect novelty
+        # Compute VFE from CLIP embeddings (if available) or fall back to A matrix
         self._update_cache()
         vfe, acc, comp, surp = 0.0, 0.0, 0.0, 0.0
+        new_belief = self._belief
 
-        if self._A_cache is not None and self._belief is not None:
-            # Belief update with VFE monitoring
+        if current_embedding is not None and self._belief is not None:
+            # Compute proper VFE with CLIP embeddings
+            # VFE = Complexity - Accuracy
+            # Complexity = KL[posterior || prior]
+            # Accuracy = E_q[log p(o|s)] where p(o|s) ~ similarity
+
+            all_embeddings, embed_node_ids = self.topo_map.get_all_embeddings()
+            if len(all_embeddings) > 0 and len(all_embeddings) == self.n_locations:
+                from .similarity import batch_cosine_similarity
+                from .core import kl_divergence
+
+                # Compute similarities to all locations as likelihoods
+                similarities = batch_cosine_similarity(current_embedding, all_embeddings)
+                # Ensure positive for log
+                similarities = jnp.maximum(similarities, 0.01)
+
+                # Prior is current belief before update
+                prior = self._belief
+
+                # Posterior via Bayesian update with similarities as likelihoods
+                new_belief = normalize(prior * similarities)
+
+                # Accuracy: E_q[log p(o|s)] = sum_s q(s) * log(similarity_s)
+                acc = float(jnp.sum(new_belief * jnp.log(similarities)))
+
+                # Complexity: KL[posterior || prior]
+                comp = float(kl_divergence(new_belief, prior))
+
+                # VFE = Complexity - Accuracy (lower is better)
+                vfe = comp - acc
+
+                # Surprisal: -log p(o) = -log sum_s p(o|s) p(s)
+                marginal = float(jnp.sum(similarities * prior))
+                surp = -np.log(max(marginal, 0.01))
+            else:
+                # Not enough embeddings yet, use simple similarity
+                acc = best_sim
+                comp = 0.0
+                surp = -np.log(max(best_sim, 0.01))
+                vfe = surp
+                new_belief = self._belief
+        elif self._A_cache is not None and self._belief is not None:
+            # Fallback: Belief update with VFE from A matrix
             likelihood = self._get_observation_likelihood(observation)
             new_belief, vfe, acc, comp, surp = belief_update_with_vfe(
                 self._belief,
                 self._A_cache,
                 obs_idx
             )
-        else:
-            new_belief = self._belief
-            likelihood = None
 
         # Decision: new location or update existing?
         new_location = False
+        is_novel = best_sim < self.similarity_threshold or surp > self.novelty_threshold
 
-        if best_sim < self.similarity_threshold or surp > self.novelty_threshold:
-            # Novel observation - add new location
-            if self.n_locations < N_MAX_LOCATIONS:
-                node = self.topo_map.add_node(observation)
+        if is_novel:
+            # Novel observation - increment hysteresis counter
+            self._consecutive_novel_frames += 1
+            self._pending_novel_obs = observation
+
+            # First location created immediately, subsequent require sustained novelty
+            frames_needed = 1 if self.n_locations == 0 else MIN_NOVEL_FRAMES_FOR_NEW_LOCATION
+            if (self._consecutive_novel_frames >= frames_needed
+                    and self.n_locations < N_MAX_LOCATIONS):
+                if current_embedding is not None:
+                    node = self.topo_map.add_node_with_embedding(observation, current_embedding)
+                else:
+                    node = self.topo_map.add_node(observation)
                 new_location = True
+                print(f"New location discovered! Total: {self.n_locations}")
 
                 # Expand belief to include new location
                 if self._belief is not None:
@@ -228,16 +311,26 @@ class WorldModel:
                 self._invalidate_cache()
                 best_id = node.id
                 best_sim = 1.0
+
+                # Reset hysteresis after creating location
+                self._consecutive_novel_frames = 0
+                self._pending_novel_obs = None
         else:
+            # Not novel - reset hysteresis counter
+            self._consecutive_novel_frames = 0
+            self._pending_novel_obs = None
+
             # Update existing location
             node = self.topo_map.get_node(best_id)
             if node is not None:
                 node.update_signature(obs_signature)
                 node.update_A_counts(observation.object_levels)
+                if current_embedding is not None:
+                    node.update_embedding(current_embedding)
                 self._invalidate_cache()
 
-            # Update belief with observation
-            if likelihood is not None and new_belief is not None:
+            # Update belief with observation (new_belief was computed in VFE section)
+            if new_belief is not None:
                 self._belief = new_belief
 
         # Learn transition if we moved
