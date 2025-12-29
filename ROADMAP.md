@@ -689,20 +689,274 @@ def localize(self, obs, action, frame):
 
 ## Future Phases
 
-### Phase 11: Visual Odometry
+### Phase 11: Semantic SLAM with Active Inference (IN PROGRESS)
+
+**Goal:** Prior-driven exploration that finds all expected rooms and objects.
+
+**Architecture (Layered):**
+```
+┌─────────────────────────────────────────────────────────┐
+│  SEMANTIC LAYER (TOP) - mapping/semantic_world_model.py │
+│  • Room type priors & classification                    │
+│  • Object tracking per place                            │
+│  • EFE pragmatic term: KL[Q(rooms)||P(rooms)]           │
+│  • "Find kitchen, bedroom, bathroom..."                 │
+├─────────────────────────────────────────────────────────┤
+│  CSCG LAYER (MIDDLE) - mapping/cscg/cscg_world_model.py │
+│  • ORB place recognition (keyframes)                    │
+│  • Clone state disambiguation                           │
+│  • Transition learning (T matrix)                       │
+│  • EFE epistemic term: reduce transition uncertainty    │
+│  • "Where am I? What connects to what?"                 │
+├─────────────────────────────────────────────────────────┤
+│  PERCEPTION LAYER (BOTTOM)                              │
+│  • ORB keypoint extraction                              │
+│  • YOLO object detection                                │
+│  • Frame preprocessing                                  │
+│  • "What do I see?"                                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Data Flow:**
+```
+Frame → ORB/YOLO → CSCG place ID → Semantic (room type + objects)
+                                          ↓
+                           EFE = epistemic(CSCG) + pragmatic(priors)
+                                          ↓
+                                    Action selection
+```
+
+**Core Insight:** Frame exploration as Expected Free Energy minimization:
+
+```
+EFE(action) = w_e * G_epistemic + w_p * G_pragmatic
+
+G_epistemic = entropy of predicted transitions (from CSCG)
+            = "Explore unknown transitions"
+
+G_pragmatic = KL[Q(rooms) || P(rooms)] + KL[Q(objects|room) || P(objects|room)]
+            = "Find all expected rooms and objects"
+```
+
+**Semantic Priors:**
+```python
+prior = SemanticPrior(
+    room_types=["living_room", "kitchen", "bedroom", "bathroom"],
+    objects_per_room={
+        "kitchen": ["refrigerator", "oven", "sink", "table"],
+        "bedroom": ["bed", "chair", "tv"],
+        "living_room": ["couch", "tv", "chair"],
+        "bathroom": ["toilet", "sink"],
+    },
+    reference_images={  # For ORB-based room classification
+        "kitchen": ["refs/kitchen_1.jpg", "refs/kitchen_2.jpg"],
+        "bedroom": ["refs/bedroom_1.jpg"],
+        ...
+    }
+)
+```
+
+**Implementation:**
+
+- [x] `mapping/semantic_world_model.py`:
+  - `SemanticWorldModel` class - wraps CSCG, adds semantic layer
+  - `SemanticPrior` dataclass - expected rooms and objects
+  - `SemanticPlace` dataclass - room type, objects per CSCG place
+  - `ObjectInstance` dataclass - tracked objects with positions
+  - `update(frame, action, yolo_detections)` - calls CSCG + semantic update
+  - `compute_efe()` - combines CSCG epistemic + semantic pragmatic
+  - `get_exploration_action()` - minimize combined EFE
+  - `get_exploration_urgency()` - based on semantic coverage
+  - Room type classification via ORB matching against references
+  - YOLO object tracking per CSCG place
+
+**Unified EFE Computation:**
+```python
+def compute_efe(self, action):
+    # Get epistemic from CSCG (transition uncertainty)
+    cscg_action, cscg_probs = self.cscg.get_exploration_target()
+    epistemic = -np.log(cscg_probs[action] + 1e-10)  # Lower prob = more info gain
+
+    # Compute pragmatic from semantic priors
+    pragmatic = 0.0
+    for predicted_place in self.cscg.predict_destinations(action):
+        sem_place = self.places.get(predicted_place)
+        if sem_place is None or sem_place.room_type is None:
+            pragmatic -= 0.5  # Unknown room type
+        elif sem_place.room_type not in self._found_room_types():
+            pragmatic -= 1.0  # New room type!
+        pragmatic -= 0.3 * len(self._missing_objects(sem_place))
+
+    return (1 - self.pragmatic_weight) * epistemic + self.pragmatic_weight * pragmatic
+```
+
+**Exploration Flow:**
+```
+1. Initialize: CSCG for places, Semantic layer with priors
+2. Each step:
+   a. CSCG localizes to place ID (ORB matching)
+   b. Semantic layer classifies room type (ORB vs reference images)
+   c. YOLO updates object list for current place
+   d. Compute EFE = CSCG epistemic + Semantic pragmatic
+   e. Select action minimizing EFE
+3. Stop when: all expected rooms found AND key objects located
+```
+
+**Files:**
+- [x] `mapping/semantic_world_model.py` - Semantic layer wrapping CSCG
+- [x] `mapping/cscg/cscg_world_model.py` - CSCG layer (already exists)
+- [ ] `refs/` directory - Reference images for room types
+- [x] Integration in `test_full_pipeline.py` - `--semantic` flag
+
+**Completed Implementation (Dec 2024):**
+
+- [x] **Layered architecture**: Semantic layer wraps CSCG (not separate)
+- [x] **Object-based room inference**: YOLO detects objects → infer room type
+  ```python
+  OBJECT_TO_ROOM = {
+      "toilet": "bathroom",
+      "bed": "bedroom",
+      "couch": "living_room",
+      "refrigerator": "kitchen",
+      ...
+  }
+  ```
+- [x] **YOLO integration in test pipeline**: Runs YOLOv8n on each frame
+- [x] **Room type voting**: Each CSCG place accumulates object→room votes
+- [x] **Stuck-at-boundary fix**: Detects repeated blocks, forces rotation
+- [x] **Unified EFE**: `(1-w)*epistemic + w*pragmatic` with configurable weight
+
+**Room Classification Methods (prioritized):**
+1. **Object inference** (implemented) - toilet→bathroom, bed→bedroom
+2. **Reference images** (optional) - ORB match against room photos
+3. **Simulator hint** (testing only) - ground truth from GLB position
+
+### Phase 11b: Spatial Object Mapping (PLANNED)
+
+**Goal:** Map objects to 3D world coordinates, not just "object X is at place Y".
+
+**Current State:**
+```
+YOLO detects "bed" at pixel (320, 400)
+  → Store: Place_5 has "bed" at normalized frame position (0.5, 0.83)
+  → Infer: Place_5 is "bedroom"
+```
+
+**Target State:**
+```
+YOLO detects "bed" at pixel (320, 400)
+  → Estimate depth: ~3 meters (from monocular depth or bbox size)
+  → Drone pose: (x=100, z=200, yaw=45°)
+  → Project to world: bed at absolute coords (102.1, 202.1)
+  → Store: "bed" at world position (102.1, 202.1)
+```
+
+**Implementation Options:**
+
+#### Option A: Monocular Depth Estimation
+- Use MiDaS or DepthAnything to estimate depth from single image
+- More accurate but computationally expensive
+- Requires GPU for real-time performance
+
+```python
+# Pseudo-code
+depth_map = midas(frame)  # H x W depth estimates
+bbox_depth = depth_map[cy, cx]  # Depth at object center
+world_pos = project_to_world(cx, cy, bbox_depth, drone_pose)
+```
+
+#### Option B: Bounding Box Size Heuristics
+- Estimate distance from known object sizes
+- Fast, no extra model needed
+- Less accurate but sufficient for coarse mapping
+
+```python
+# Known object heights (meters)
+OBJECT_HEIGHTS = {
+    "person": 1.7,
+    "chair": 0.9,
+    "refrigerator": 1.8,
+    "bed": 0.5,  # height when lying flat
+    "toilet": 0.4,
+    ...
+}
+
+def estimate_distance(class_name, bbox_height_pixels, frame_height, fov_y):
+    real_height = OBJECT_HEIGHTS.get(class_name, 0.5)
+    # Pinhole camera model: distance = (real_height * focal_length) / pixel_height
+    focal_length = frame_height / (2 * tan(fov_y / 2))
+    distance = (real_height * focal_length) / bbox_height_pixels
+    return distance
+```
+
+#### Option C: Hybrid Approach (Recommended)
+- Use bbox heuristics for coarse estimates (always available)
+- Refine with monocular depth when GPU available
+- Triangulate from multiple viewpoints for accuracy
+
+**Data Structures:**
+
+```python
+@dataclass
+class SpatialObject:
+    class_name: str
+    world_position: Tuple[float, float]  # (x, z) in world coords
+    position_confidence: float  # Higher with more observations
+    observation_count: int
+    last_seen_place_id: int
+
+    # For triangulation
+    observations: List[ObjectObservation]  # Multiple viewpoints
+
+@dataclass
+class ObjectObservation:
+    place_id: int
+    drone_pose: Tuple[float, float, float]  # (x, z, yaw)
+    pixel_position: Tuple[float, float]  # Normalized (cx, cy)
+    estimated_distance: float
+    confidence: float
+```
+
+**Triangulation from Multiple Views:**
+```
+View 1: drone at (0, 0, 0°), object at pixel (0.7, 0.5) → ray at 20° right
+View 2: drone at (2, 0, 45°), object at pixel (0.3, 0.5) → ray at -25° left
+  → Intersect rays → object at world (1.5, 3.2)
+```
+
+**Files to Create:**
+- [ ] `mapping/spatial_objects.py` - SpatialObject tracking
+- [ ] `mapping/depth_estimation.py` - Monocular depth (MiDaS/DepthAnything)
+- [ ] `mapping/object_triangulation.py` - Multi-view object localization
+
+**Integration with Semantic Layer:**
+```python
+class SemanticWorldModel:
+    def update(self, frame, action, yolo_detections, drone_pose):
+        # ... existing CSCG + room inference ...
+
+        # NEW: Spatial object mapping
+        if yolo_detections and drone_pose:
+            for det in yolo_detections:
+                distance = self.estimate_distance(det)
+                world_pos = self.project_to_world(det, distance, drone_pose)
+                self.spatial_objects.update(det.class_name, world_pos, drone_pose)
+```
+
+### Phase 12: Visual Odometry
 
 - [ ] Add lightweight VO (optical flow + essential matrix)
 - [ ] Estimate relative pose between frames
 - [ ] Feed motion cues into CSCG transition learning
 - [ ] No global SLAM needed - local consistency sufficient
 
-### Phase 12: Room Hierarchy via Community Detection
+### Phase 13: Room Hierarchy via Community Detection
 
 - [ ] Run graph community detection on learned CSCG structure
 - [ ] Communities = room-level abstractions
 - [ ] High-level POMDP for room-to-room navigation
 
-### Phase 13: Full Hierarchical Controller
+### Phase 14: Full Hierarchical Controller
 
 ```
 High-level (room policy):

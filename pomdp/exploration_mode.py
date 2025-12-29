@@ -206,25 +206,198 @@ class ExplorationModePOMDP:
         Select action using two-phase approach:
         1. Bootstrap: Simple scan + forward until CSCG has learned
         2. CSCG-driven: Delegate to CSCG's EFE-based exploration
+
+        IMPORTANT: If CSCG returns near-uniform probabilities, fall back to
+        random exploration since the model hasn't learned meaningful transitions.
         """
         n_locations = world_model.n_locations
         debug = (self._total_frames % 30 == 0)  # Debug every 30 frames
 
-        # Phase 1: Bootstrap - CSCG hasn't learned enough yet
-        if n_locations < 2:
+        # Track if we're stuck - either at same place OR oscillating between 2-3 places
+        if not hasattr(self, '_recent_places'):
+            self._recent_places = []  # Track last N places
+            self._stuck_frames = 0
+            self._escape_action_idx = 0
+
+        current_place = loc_result.token
+        self._recent_places.append(current_place)
+        if len(self._recent_places) > 30:  # Track last 30 places (~1 sec)
+            self._recent_places.pop(0)
+
+        # Check if stuck: oscillating between same 1-3 places
+        unique_places = set(self._recent_places[-20:]) if len(self._recent_places) >= 20 else set()
+        is_oscillating = len(unique_places) <= 3 and len(self._recent_places) >= 20
+
+        if is_oscillating:
+            self._stuck_frames += 1
+        else:
+            self._stuck_frames = 0
+            self._escape_action_idx = 0
+
+        # If stuck (oscillating between same places) for too long, try escape sequence
+        if self._stuck_frames > 40:  # ~1.3 seconds of oscillation
+            # More aggressive escape: mostly turn to find new direction
+            escape_actions = [4, 4, 4, 1, 3, 3, 3, 1, 2, 2, 4, 4, 1]  # turn right 3x, forward, turn left 3x, forward, back 2x, etc.
+            action = escape_actions[self._escape_action_idx % len(escape_actions)]
+            self._escape_action_idx += 1
             if debug:
-                print(f"  [EXPLORE] Bootstrap phase (n_locs={n_locations})")
+                action_names = ['stay', 'forward', 'backward', 'left', 'right']
+                places_str = ','.join(str(p) for p in unique_places)
+                print(f"  [EXPLORE] Oscillating between places [{places_str}] for {self._stuck_frames} frames, trying {action_names[action]}")
+            return action
+
+        # Check if we've been blocked repeatedly - need to find a clear path
+        if not hasattr(self, '_consecutive_blocked'):
+            self._consecutive_blocked = 0
+        if not hasattr(self, '_rotation_escape_count'):
+            self._rotation_escape_count = 0
+
+        if self._consecutive_blocked >= 2:
+            # We're blocked - rotate to find a clear direction
+            self._rotation_escape_count += 1
+
+            # After 4 rotations in one direction, try the other direction
+            # After 8 total rotations (full circle), try backward
+            if self._rotation_escape_count <= 4:
+                action = 4  # turn right
+                if debug:
+                    print(f"  [EXPLORE] Blocked, rotating right ({self._rotation_escape_count}/4)")
+            elif self._rotation_escape_count <= 8:
+                action = 3  # turn left
+                if debug:
+                    print(f"  [EXPLORE] Blocked, rotating left ({self._rotation_escape_count - 4}/4)")
+            elif self._rotation_escape_count <= 12:
+                action = 2  # backward
+                if debug:
+                    print(f"  [EXPLORE] Blocked everywhere, going backward")
+            else:
+                # Reset and try again
+                self._rotation_escape_count = 0
+                self._consecutive_blocked = 0
+                action = 1  # forward
+                if debug:
+                    print(f"  [EXPLORE] Reset escape, trying forward")
+
+            # Every 2 rotations, try forward to see if path is clear
+            if self._rotation_escape_count % 2 == 0 and self._rotation_escape_count <= 8:
+                action = 1  # try forward
+                if debug:
+                    print(f"  [EXPLORE] Testing forward after rotation")
+
+            return action
+
+        # Phase 1: Bootstrap - CSCG hasn't learned enough yet
+        # Need at least 3 locations AND some time to learn transitions
+        min_bootstrap_frames = 300  # At least 300 frames before trusting CSCG
+        if n_locations < 3 or self._total_frames < min_bootstrap_frames:
+            if debug:
+                print(f"  [EXPLORE] Bootstrap phase (n_locs={n_locations}, frames={self._total_frames})")
             return self._bootstrap_action(debug=debug)
 
-        # Phase 2: CSCG-driven - use EFE-based exploration target
+        # Phase 2: Try CSCG-driven exploration
         if hasattr(world_model, 'get_exploration_target'):
-            action_idx, reason = world_model.get_exploration_target()
-            if debug:
-                print(f"  [EXPLORE] CSCG-driven: action={action_idx}, reason={reason}")
+            action_idx, action_probs = world_model.get_exploration_target()
+
+            # Check if probabilities are near-uniform (CSCG hasn't learned)
+            # If max prob is < 0.25 (for 5 actions, uniform = 0.20), it's basically random
+            max_prob = float(np.max(action_probs))
+            prob_range = float(np.max(action_probs) - np.min(action_probs))
+
+            if prob_range < 0.05:  # Less than 5% difference = essentially uniform
+                if debug:
+                    print(f"  [EXPLORE] CSCG uniform (range={prob_range:.3f}), using systematic exploration")
+                return self._systematic_exploration_action(debug=debug)
+
+            # Never use action=0 (stay) during exploration - pick best movement action
+            if action_idx == 0:
+                # Find best movement action (indices 1-4)
+                movement_probs = action_probs[1:5]  # forward, backward, left, right
+                action_idx = int(np.argmax(movement_probs)) + 1
+                if debug:
+                    print(f"  [EXPLORE] CSCG wanted stay, using action={action_idx} instead")
+            else:
+                if debug:
+                    print(f"  [EXPLORE] CSCG-driven: action={action_idx}, max_prob={max_prob:.3f}")
+
             return int(action_idx)
 
-        # Fallback to bootstrap if no CSCG
-        return self._bootstrap_action(debug=debug)
+        # Fallback to random exploration
+        return self._random_exploration_action(debug=debug)
+
+    def _systematic_exploration_action(self, debug: bool = False) -> int:
+        """
+        Systematic exploration using a sweep pattern.
+
+        Pattern: Forward until blocked, then turn right 90°, repeat.
+        This covers more area than random wandering.
+        """
+        # Initialize sweep state
+        if not hasattr(self, '_sweep_forward_count'):
+            self._sweep_forward_count = 0
+            self._sweep_turn_count = 0
+            self._sweep_direction = 4  # Start turning right
+
+        # Check if we've been blocked
+        blocked = getattr(self, '_consecutive_blocked', 0) > 0
+
+        if blocked:
+            # We hit a wall - turn to find new direction
+            self._sweep_forward_count = 0
+            self._sweep_turn_count += 1
+
+            # After 6 turns (full rotation), try the other direction
+            if self._sweep_turn_count > 6:
+                self._sweep_turn_count = 0
+                self._sweep_direction = 3 if self._sweep_direction == 4 else 4
+
+            action = self._sweep_direction
+            if debug:
+                print(f"  [EXPLORE] Systematic: blocked, turning {'right' if action == 4 else 'left'}")
+        else:
+            # Not blocked - move forward, but occasionally turn to look around
+            self._sweep_forward_count += 1
+
+            # Every 10 forward moves, do a scan (turn left, then right)
+            if self._sweep_forward_count % 30 == 10:
+                action = 3  # turn left to scan
+                if debug:
+                    print(f"  [EXPLORE] Systematic: scanning left")
+            elif self._sweep_forward_count % 30 == 20:
+                action = 4  # turn right to scan
+                if debug:
+                    print(f"  [EXPLORE] Systematic: scanning right")
+            else:
+                action = 1  # forward
+                if debug:
+                    print(f"  [EXPLORE] Systematic: forward (step {self._sweep_forward_count})")
+
+        return action
+
+    def _random_exploration_action(self, debug: bool = False) -> int:
+        """
+        Random exploration with bias toward forward movement.
+
+        This is used when CSCG hasn't learned meaningful transitions yet.
+        Biases toward forward movement to actually explore new areas.
+        """
+        self._rotation_frames += 1
+
+        # 60% forward, 15% turn left, 15% turn right, 10% backward
+        r = np.random.random()
+        if r < 0.60:
+            action = 1  # forward
+        elif r < 0.75:
+            action = 3  # turn left
+        elif r < 0.90:
+            action = 4  # turn right
+        else:
+            action = 2  # backward
+
+        if debug:
+            action_names = ['stay', 'forward', 'backward', 'left', 'right']
+            print(f"  [EXPLORE] Random exploration: {action_names[action]}")
+
+        return action
 
     def _bootstrap_action(self, debug: bool = False) -> int:
         """
@@ -270,12 +443,21 @@ class ExplorationModePOMDP:
         """Record whether a movement action succeeded (didn't hit wall)."""
         if not hasattr(self, '_consecutive_blocked'):
             self._consecutive_blocked = 0
+        if not hasattr(self, '_rotation_escape_count'):
+            self._rotation_escape_count = 0
 
         if action == 1:  # forward
             if succeeded:
+                # Successfully moved forward - reset all escape state
                 self._consecutive_blocked = 0
+                self._rotation_escape_count = 0
             else:
                 self._consecutive_blocked += 1
+        elif action == 2:  # backward
+            if succeeded:
+                # Successfully moved backward - reset escape state
+                self._consecutive_blocked = 0
+                self._rotation_escape_count = 0
 
     def _scanning_action(self) -> int:
         """
@@ -413,6 +595,16 @@ class ExplorationModePOMDP:
         self._frames_without_new_location = 0
         self._last_n_locations = 0
         self._consecutive_blocked = 0
+        # Systematic exploration state
+        self._sweep_forward_count = 0
+        self._sweep_turn_count = 0
+        self._sweep_direction = 4
+        # Stuck detection state (oscillation-aware)
+        self._recent_places = []
+        self._stuck_frames = 0
+        self._escape_action_idx = 0
+        # Rotation escape state
+        self._rotation_escape_count = 0
 
     def get_statistics(self) -> dict:
         """Get exploration statistics."""

@@ -42,7 +42,7 @@ class GLBSimulator:
 
         # Find model path
         if glb_path is None:
-            glb_path = Path(__file__).parent / "simple_house.glb"
+            glb_path = Path(__file__).parent / "home_-_p3.glb"
         self.glb_path = Path(glb_path)
 
         # Camera state - start in middle of house, looking along X
@@ -58,17 +58,10 @@ class GLBSimulator:
         self.move_speed = 30.0  # Units per step (model is ~1000 units)
         self.turn_speed = math.radians(15)
 
-        # Room definitions based on model layout
-        # These are approximations - adjust based on actual model
-        self.rooms = {
-            "Living Room": ((-200, 200), (-600, -200)),   # x range, z range
-            "Kitchen": ((200, 400), (-600, -200)),
-            "Bedroom": ((-200, 200), (-1200, -600)),
-            "Bathroom": ((200, 400), (-1200, -600)),
-            "Hallway": ((-50, 50), (-600, -200)),
-        }
+        # Room definitions - will be set after loading model
+        self.rooms = {}
 
-        # Load model
+        # Load model (also sets up room definitions based on model bounds)
         self._load_model()
 
     def _load_model(self):
@@ -88,8 +81,54 @@ class GLBSimulator:
         print(f"Model center: {self.model_center}")
         print(f"Model extents: {self.model_extents}")
 
-        # Create pyrender scene
-        self.scene = pyrender.Scene.from_trimesh_scene(self.trimesh_scene)
+        # Create pyrender scene - filter out non-mesh geometry (Path3D, PointCloud, etc.)
+        self.scene = pyrender.Scene()
+
+        # Add meshes from trimesh scene with their transforms
+        mesh_count = 0
+        skip_count = 0
+
+        if hasattr(self.trimesh_scene, 'graph') and hasattr(self.trimesh_scene, 'geometry'):
+            # Scene with graph - iterate through nodes to get transforms
+            for node_name in self.trimesh_scene.graph.nodes_geometry:
+                try:
+                    # Get the transform and geometry name for this node
+                    transform, geom_name = self.trimesh_scene.graph[node_name]
+                    geom = self.trimesh_scene.geometry.get(geom_name)
+
+                    if geom is None:
+                        continue
+
+                    # Only process actual meshes
+                    if isinstance(geom, trimesh.Trimesh):
+                        mesh = pyrender.Mesh.from_trimesh(geom)
+                        self.scene.add(mesh, pose=transform)
+                        mesh_count += 1
+                    else:
+                        skip_count += 1
+                except Exception as e:
+                    skip_count += 1
+
+        elif hasattr(self.trimesh_scene, 'geometry'):
+            # Fallback: add meshes without transforms
+            for name, geom in self.trimesh_scene.geometry.items():
+                if isinstance(geom, trimesh.Trimesh):
+                    try:
+                        mesh = pyrender.Mesh.from_trimesh(geom)
+                        self.scene.add(mesh)
+                        mesh_count += 1
+                    except Exception as e:
+                        skip_count += 1
+                else:
+                    skip_count += 1
+
+        elif isinstance(self.trimesh_scene, trimesh.Trimesh):
+            # Single mesh
+            mesh = pyrender.Mesh.from_trimesh(self.trimesh_scene)
+            self.scene.add(mesh)
+            mesh_count = 1
+
+        print(f"Loaded {mesh_count} meshes (skipped {skip_count} non-mesh objects)")
 
         # Add ambient light
         self.scene.ambient_light = np.array([0.4, 0.4, 0.4])
@@ -116,12 +155,139 @@ class GLBSimulator:
         # Create offscreen renderer
         self.renderer = pyrender.OffscreenRenderer(self.width, self.height)
 
-        # Position camera at model center, above floor
+        # Position camera at model center, at door-height level
+        # Y is vertical axis - start near floor level + door midpoint height
+        bounds = self.trimesh_scene.bounds
+        floor_y = bounds[0][1]  # Bottom of model (floor level)
+        ceiling_y = bounds[1][1]  # Top of model
+        room_height = ceiling_y - floor_y
+
+        # Door is typically ~80% of room height, midpoint is ~40% up from floor
+        door_midpoint = floor_y + room_height * 0.4
+
         self.x = self.model_center[0]
-        self.y = 200.0  # Eye height
+        self.y = door_midpoint
         self.z = self.model_center[2]
 
+        print(f"Starting position: ({self.x:.1f}, {self.y:.1f}, {self.z:.1f})")
+        print(f"Floor Y: {floor_y:.1f}, Ceiling Y: {ceiling_y:.1f}, Door height: {door_midpoint:.1f}")
+
+        # Set up room definitions based on model bounds
+        self._setup_rooms()
+
         print("Model loaded successfully!")
+
+    def _setup_rooms(self):
+        """
+        Set up room definitions based on model bounds.
+
+        Divides the model into a grid of rooms for navigation tracking.
+        """
+        bounds = self.trimesh_scene.bounds
+        x_min, y_min, z_min = bounds[0]
+        x_max, y_max, z_max = bounds[1]
+
+        # Add margin to keep drone inside
+        margin = 50
+        x_min += margin
+        x_max -= margin
+        z_min += margin
+        z_max -= margin
+
+        # Store navigable bounds (including Y for floor/ceiling)
+        # Keep drone between 30% and 70% of room height
+        y_floor = y_min + (y_max - y_min) * 0.25
+        y_ceiling = y_min + (y_max - y_min) * 0.70
+        self._nav_bounds = (x_min, x_max, y_floor, y_ceiling, z_min, z_max)
+
+        # Divide into 2x3 grid of rooms (typical house layout)
+        x_mid = (x_min + x_max) / 2
+        z_third = (z_max - z_min) / 3
+
+        z_front = z_max
+        z_mid1 = z_max - z_third
+        z_mid2 = z_max - 2 * z_third
+        z_back = z_min
+
+        # Room definitions: (x_range, z_range)
+        self.rooms = {
+            "Living Room": ((x_min, x_mid), (z_mid1, z_front)),
+            "Kitchen": ((x_mid, x_max), (z_mid1, z_front)),
+            "Hallway": ((x_min, x_max), (z_mid2, z_mid1)),
+            "Bedroom": ((x_min, x_mid), (z_back, z_mid2)),
+            "Bathroom": ((x_mid, x_max), (z_back, z_mid2)),
+        }
+
+        print(f"Room layout configured:")
+        for name, ((xlo, xhi), (zlo, zhi)) in self.rooms.items():
+            print(f"  {name}: x=[{xlo:.0f}, {xhi:.0f}], z=[{zlo:.0f}, {zhi:.0f}]")
+        print(f"Vertical bounds: Y=[{y_floor:.0f}, {y_ceiling:.0f}] (floor to ceiling)")
+
+    def _check_depth_obstacle(self, action: int, min_distance: float = 80.0) -> bool:
+        """
+        Check for obstacles using the depth buffer (simulates depth sensor).
+
+        This method renders the current view and checks if there's an obstacle
+        too close in the direction of movement. Works like a real depth sensor.
+
+        Args:
+            action: Movement action (1=forward, 2=back)
+            min_distance: Minimum distance (in scene units) to consider blocked
+
+        Returns:
+            True if path is blocked, False if clear
+        """
+        # Render current view to get depth buffer
+        self._update_camera()
+        color, depth = self.renderer.render(self.scene)
+
+        # pyrender depth buffer:
+        # - Returns linear depth (distance from camera in scene units)
+        # - 0 means at znear or no geometry
+        # - Larger values = farther away
+        # - Need to find MINIMUM non-zero value for closest obstacle
+
+        h, w = depth.shape
+
+        if action == 1:  # Forward - check center region of view
+            center_y = h // 2
+            center_x = w // 2
+            # Sample a rectangular region in center where we're heading
+            y1, y2 = max(0, center_y - 40), min(h, center_y + 40)
+            x1, x2 = max(0, center_x - 80), min(w, center_x + 80)
+            sample_region = depth[y1:y2, x1:x2]
+        else:  # Backward - can't see behind, skip check
+            return False
+
+        if sample_region.size == 0:
+            return False
+
+        # Find closest object (minimum non-zero depth)
+        # Filter out 0/inf values (background/sky/no geometry)
+        valid_mask = (sample_region > 0) & (sample_region < 10000)
+        valid_depths = sample_region[valid_mask]
+
+        if len(valid_depths) == 0:
+            return False  # No obstacles detected (open space)
+
+        closest_distance = np.min(valid_depths)
+
+        # Blocked if closest object is nearer than min_distance
+        if closest_distance < min_distance:
+            return True
+
+        return False
+
+    def get_depth_buffer(self) -> np.ndarray:
+        """
+        Get the current depth buffer from the camera view.
+
+        Returns:
+            Depth image where values represent distance from camera.
+        """
+        self._update_camera()
+        color, depth = self.renderer.render(self.scene)
+        return depth
 
     def _rotation_matrix(self, yaw: float, pitch: float, roll: float = 0) -> np.ndarray:
         """Create rotation matrix from Euler angles."""
@@ -183,19 +349,39 @@ class GLBSimulator:
             debug: Print debug info
 
         Returns:
-            True if movement succeeded
+            True if movement succeeded, False if blocked by boundary
         """
         action_names = ['stay', 'forward', 'back', 'left', 'right',
                        'strafe_left', 'strafe_right', 'look_up', 'look_down']
 
+        # Save old position for collision check
+        old_x, old_z = self.x, self.z
+
+        # Check depth-based obstacle detection BEFORE moving (like real drone)
+        obstacle_ahead = False
+        if action in (1, 2):  # Forward or backward
+            obstacle_ahead = self._check_depth_obstacle(action)
+
+        moved = True
+
         if action == 0:  # Stay
             pass
         elif action == 1:  # Forward
-            self.x += self.move_speed * math.sin(self.yaw)
-            self.z -= self.move_speed * math.cos(self.yaw)
+            if obstacle_ahead:
+                moved = False
+                if debug:
+                    print(f"  [GLB] BLOCKED by wall (depth sensor)!")
+            else:
+                self.x += self.move_speed * math.sin(self.yaw)
+                self.z -= self.move_speed * math.cos(self.yaw)
         elif action == 2:  # Back
-            self.x -= self.move_speed * math.sin(self.yaw)
-            self.z += self.move_speed * math.cos(self.yaw)
+            if obstacle_ahead:
+                moved = False
+                if debug:
+                    print(f"  [GLB] BLOCKED by wall (depth sensor)!")
+            else:
+                self.x -= self.move_speed * math.sin(self.yaw)
+                self.z += self.move_speed * math.cos(self.yaw)
         elif action == 3:  # Turn left
             self.yaw += self.turn_speed
         elif action == 4:  # Turn right
@@ -214,11 +400,42 @@ class GLBSimulator:
         # Normalize yaw
         self.yaw = self.yaw % (2 * math.pi)
 
-        if debug:
+        # Check bounds - keep drone inside the model
+        if action in (1, 2, 5, 6) and moved:  # Movement actions
+            if not self._is_inside_bounds(self.x, self.z):
+                # Revert movement
+                self.x, self.z = old_x, old_z
+                moved = False
+                if debug:
+                    print(f"  [GLB] BLOCKED at boundary!")
+
+        if debug and moved:
             room = self._get_current_room()
             print(f"  [GLB] Moved {action_names[action]} to ({self.x:.0f},{self.y:.0f},{self.z:.0f}) yaw={math.degrees(self.yaw):.0f}° room={room}")
 
-        return True
+        return moved
+
+    def _is_inside_bounds(self, x: float, z: float, y: float = None) -> bool:
+        """
+        Check if position is inside the navigable house area.
+
+        Uses dynamically computed bounds from model geometry.
+        """
+        if y is None:
+            y = self.y
+
+        if hasattr(self, '_nav_bounds'):
+            x_min, x_max, y_floor, y_ceiling, z_min, z_max = self._nav_bounds
+        else:
+            # Fallback to model bounds
+            bounds = self.trimesh_scene.bounds
+            x_min, x_max = bounds[0][0], bounds[1][0]
+            y_floor, y_ceiling = bounds[0][1], bounds[1][1]
+            z_min, z_max = bounds[0][2], bounds[1][2]
+
+        return (x_min <= x <= x_max and
+                y_floor <= y <= y_ceiling and
+                z_min <= z <= z_max)
 
     def render(self) -> np.ndarray:
         """Render current view."""

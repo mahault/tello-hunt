@@ -169,6 +169,10 @@ class CSCGWorldModel:
         self._action_history: List[int] = []
         self._max_history = 1000
 
+        # Obstacle tracking: blocked_actions[place_id][action] = count
+        # This helps the agent avoid recommending actions that don't work
+        self._blocked_actions: Dict[int, Dict[int, int]] = {}
+
         # Image encoder (lazy loaded) - only for CLIP/DINOv2
         self._image_encoder = None
 
@@ -391,12 +395,18 @@ class CSCGWorldModel:
         """
         n_found = self.n_locations
         n_expected = self.expected_places
+        history_len = len(self._token_history)
 
         # Factor 1: Haven't found all expected places
         place_ratio = n_found / max(n_expected, 1)
         place_urgency = max(0, 1.0 - place_ratio)
 
-        # Factor 2: Belief entropy (high entropy = uncertain = explore)
+        # Factor 2: Not enough data collected yet
+        # Need significant exploration history before considering "done"
+        min_history = 500  # At least 500 observations
+        data_urgency = max(0, 1.0 - history_len / min_history)
+
+        # Factor 3: Belief entropy (high entropy = uncertain = explore)
         if self._belief is not None and len(self._belief) > 1:
             # Normalized entropy
             entropy = -np.sum(self._belief * np.log(self._belief + 1e-10))
@@ -405,7 +415,7 @@ class CSCGWorldModel:
         else:
             belief_urgency = 1.0  # No belief yet, definitely explore
 
-        # Factor 3: Transition uncertainty (unexplored connections)
+        # Factor 4: Transition uncertainty (unexplored connections)
         if self._chmm is not None:
             # Count how many transitions are still uniform (unexplored)
             T = self._chmm.T
@@ -428,11 +438,13 @@ class CSCGWorldModel:
         else:
             transition_urgency = 1.0
 
-        # Combine factors
-        urgency = 0.4 * place_urgency + 0.3 * belief_urgency + 0.3 * transition_urgency
+        # Combine factors - data collection is most important early on
+        urgency = 0.3 * place_urgency + 0.35 * data_urgency + 0.15 * belief_urgency + 0.2 * transition_urgency
 
         # Generate reason
-        if place_urgency > 0.5:
+        if data_urgency > 0.5:
+            reason = f"Need more data ({history_len}/{min_history} observations)"
+        elif place_urgency > 0.5:
             reason = f"Only found {n_found}/{n_expected} expected places"
         elif belief_urgency > 0.5:
             reason = "High uncertainty about current location"
@@ -453,6 +465,7 @@ class CSCGWorldModel:
         Get recommended action for exploration.
 
         Uses entropy reduction heuristic: prefer actions that reduce uncertainty.
+        Also penalizes actions that have been blocked at the current place.
 
         Returns:
             (best_action, action_scores)
@@ -475,6 +488,11 @@ class CSCGWorldModel:
             entropy = -np.sum(predicted * np.log(predicted + 1e-10))
             action_scores[action] = -entropy
 
+        # Apply obstacle penalty: actions that have been blocked get lower scores
+        block_penalties = self.get_blocked_penalty()
+        # Each block reduces the score significantly
+        action_scores = action_scores - block_penalties * 2.0
+
         # Softmax for probabilities
         action_scores = action_scores - action_scores.max()
         action_probs = np.exp(action_scores)
@@ -482,6 +500,62 @@ class CSCGWorldModel:
 
         best_action = int(np.argmax(action_probs))
         return best_action, action_probs
+
+    def record_blocked_action(self, action: int, place_id: int = None):
+        """
+        Record that an action was blocked (hit obstacle) at a place.
+
+        This information is used to penalize actions that don't work,
+        so the agent learns to avoid walls/obstacles.
+
+        Args:
+            action: The action that was blocked (1=forward, 2=backward, etc.)
+            place_id: The place where blocking occurred (defaults to current place)
+        """
+        if place_id is None:
+            place_id = self._prev_token
+
+        if place_id < 0:
+            return  # No valid place yet
+
+        if place_id not in self._blocked_actions:
+            self._blocked_actions[place_id] = {}
+
+        if action not in self._blocked_actions[place_id]:
+            self._blocked_actions[place_id][action] = 0
+
+        self._blocked_actions[place_id][action] += 1
+
+    def get_blocked_penalty(self, place_id: int = None) -> np.ndarray:
+        """
+        Get penalty scores for blocked actions at a place.
+
+        Returns array of penalties (higher = more blocked = avoid).
+
+        Args:
+            place_id: Place to check (defaults to current place)
+
+        Returns:
+            Array of shape (n_actions,) with block counts
+        """
+        if place_id is None:
+            place_id = self._prev_token
+
+        penalties = np.zeros(self.n_actions)
+
+        if place_id in self._blocked_actions:
+            for action, count in self._blocked_actions[place_id].items():
+                if action < self.n_actions:
+                    penalties[action] = count
+
+        return penalties
+
+    def clear_blocked_actions(self, place_id: int = None):
+        """Clear blocked action history for a place (or all places)."""
+        if place_id is None:
+            self._blocked_actions.clear()
+        elif place_id in self._blocked_actions:
+            del self._blocked_actions[place_id]
 
     def bridge(self, target_token: int, max_steps: int = 50) -> Optional[List[int]]:
         """
