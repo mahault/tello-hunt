@@ -83,12 +83,24 @@ except ImportError:
     DepthEstimator = None
     print("Depth estimation not available (pip install transformers)")
 
+# Collision avoidance (optical flow + depth hybrid)
+try:
+    from utils.collision_avoidance import CollisionAvoidance, RiskLevel, create_collision_reflex
+    HAS_COLLISION = True
+except ImportError:
+    HAS_COLLISION = False
+    print("Collision avoidance not available")
+
 # Spatial mapping (occupancy grid + odometry)
 from utils.occupancy_map import SpatialMapper
 
+# Topological exploration (pure camera-only approach)
+from pomdp.topological_map import TopologicalMap
+from pomdp.topological_explorer import TopologicalExplorer
+
 # For fake YOLO detections
 from dataclasses import dataclass
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 
 @dataclass
@@ -187,9 +199,10 @@ class FullPipelineSimulator:
     - Semantic: EFE-based exploration with room/object priors
     """
 
-    def __init__(self, use_glb: bool = True, use_semantic: bool = False):
+    def __init__(self, use_glb: bool = True, use_semantic: bool = False, use_topological: bool = False):
         # 3D Simulator - prefer GLB for realistic textures
         self.use_glb = use_glb and HAS_GLB
+        self.use_topological = use_topological
         if self.use_glb:
             print("Using GLB simulator (realistic textures for ORB)")
             self.sim = GLBSimulator(width=640, height=480)
@@ -267,10 +280,27 @@ class FullPipelineSimulator:
             self.depth_estimator = DepthEstimator(model_type="depth_anything")
             print("Depth estimator ready!")
 
+        # Hybrid collision avoidance (optical flow + depth)
+        self.collision_avoidance = None
+        if HAS_COLLISION:
+            self.collision_avoidance = create_collision_reflex(
+                depth_estimator=self.depth_estimator
+            )
+            print("Collision avoidance (flow + depth) ready!")
+
         # Other POMDPs
         self.exploration = ExplorationModePOMDP()
         self.human_search = HumanSearchPOMDP(n_locations=1)
         self.interaction = InteractionModePOMDP()
+
+        # Topological exploration (pure place-graph approach)
+        if self.use_topological:
+            print("Initializing Topological Explorer (pure place-graph)...")
+            self.topo_map = TopologicalMap()
+            self.topo_explorer = TopologicalExplorer()
+            self._topo_prev_place = None
+            self._topo_prev_action = None
+            self._topo_prev_moved = False
 
         # Mode
         self.mode = "exploration"
@@ -286,6 +316,11 @@ class FullPipelineSimulator:
         # Room classification tracking for analysis
         # Maps place_id -> {'ground_truth': [rooms], 'predicted': [rooms]}
         self._room_tracking: Dict[int, Dict[str, List[str]]] = {}
+
+        # Room visit tracking for topological mode
+        self._rooms_visited: Dict[str, int] = {}  # room_name -> visit_count
+        self._room_transitions: List[Tuple[str, str]] = []  # (from_room, to_room)
+        self._last_room: str = None
 
         model_type = "Semantic (EFE)" if self.use_semantic else "CSCG (ORB)"
         print(f"Ready! ({model_type} world model)")
@@ -459,9 +494,25 @@ class FullPipelineSimulator:
 
             self._semantic_result = None
 
+        # Topological exploration updates
+        current_place_id = loc_result.token if hasattr(loc_result, 'token') else loc_result.clone_state
+        if self.use_topological:
+            # Observe the current place
+            self.topo_map.observe_place(current_place_id)
+            self.topo_explorer.update_history(current_place_id)
+
+            # Record transition from previous frame
+            if self._topo_prev_place is not None and self._topo_prev_action is not None:
+                self.topo_map.record_transition(
+                    self._topo_prev_place,
+                    self._topo_prev_action,
+                    current_place_id,
+                    moved=self._topo_prev_moved
+                )
+
         # Mode-specific update
         if self.mode == "exploration":
-            result = self._exploration_update(obs, loc_result)
+            result = self._exploration_update(obs, loc_result, depth_map)
         else:
             result = self._hunting_update(obs, loc_result, visible_person)
 
@@ -471,40 +522,77 @@ class FullPipelineSimulator:
         else:
             action = manual_action
 
-        # Depth-based obstacle prediction (realistic - predicts before moving)
-        depth_blocked = False
-        if depth_distances is not None and action in (1, 2):  # forward or backward
-            direction = 'forward' if action == 1 else 'forward'  # backward uses same check
+        # Hybrid collision avoidance (optical flow + depth)
+        collision_blocked = False
+        collision_state = None
+        debug_this_frame = (self._frame_count % 30 == 0)
+
+        if self.collision_avoidance is not None and action in (1, 2):
+            # Assess collision risk using flow + depth
+            collision_state = self.collision_avoidance.assess_risk(
+                frame, depth_map, debug=debug_this_frame
+            )
+
+            # Get safe action (may override desired action)
+            safe_action, reason = self.collision_avoidance.get_safe_action(
+                action, collision_state, debug=debug_this_frame
+            )
+
+            if safe_action != action:
+                collision_blocked = True
+                if debug_this_frame:
+                    print(f"  [COLLISION] {reason}: action {action} -> {safe_action} "
+                          f"(risk={collision_state.combined_risk:.2f}, ttc={collision_state.ttc_estimate:.1f}s)")
+                action = safe_action
+
+        elif depth_distances is not None and action in (1, 2):
+            # Fallback to depth-only blocking if collision avoidance not available
             path_clear, path_distance = self.depth_estimator.is_path_clear(
                 depth_map, direction='forward', threshold=0.25
             )
-            if not path_clear and action == 1:  # Only block forward based on depth
-                depth_blocked = True
-                if self._frame_count % 30 == 0:
+            if not path_clear and action == 1:
+                collision_blocked = True
+                if debug_this_frame:
                     print(f"  [DEPTH] Obstacle detected! Distance={path_distance:.2f}")
 
-        # Execute action with debug
-        debug_this_frame = (self._frame_count % 30 == 0)  # Debug every 30 frames
+        # Execute action
         moved = True
         if action > 0:
-            # If depth predicts obstacle, still try but report to CSCG preemptively
-            if depth_blocked:
+            # If collision predicted, report to CSCG preemptively
+            if collision_blocked:
                 self.cscg.record_blocked_action(action)
                 if self.mode == "exploration":
                     self.exploration.record_movement_result(action, False)
 
             moved = self.sim.move(action, debug=debug_this_frame)
             # Report movement result to exploration (for wall detection)
-            if self.mode == "exploration" and not depth_blocked:
+            if self.mode == "exploration" and not collision_blocked:
                 self.exploration.record_movement_result(action, moved)
             # Report blocked actions to CSCG so it learns obstacles
-            if not moved and not depth_blocked:
+            if not moved and not collision_blocked:
                 self.cscg.record_blocked_action(action)
                 if debug_this_frame:
                     print(f"  [PIPELINE] Action {action} blocked at place {self.cscg._prev_token}")
 
         self._last_action = action
         self._frame_count += 1
+
+        # Save state for topological tracking
+        if self.use_topological:
+            self._topo_prev_place = current_place_id
+            self._topo_prev_action = action
+            self._topo_prev_moved = moved and not collision_blocked
+            # Inform explorer about blocked movements (for scan/escape mode)
+            was_blocked = not moved or collision_blocked
+            if action in [1, 2, 5, 6]:  # All movement actions (forward, back, strafe)
+                self.topo_explorer.record_block(was_blocked)
+
+        # Track room visits for analysis
+        current_room = self.sim._get_current_room() if hasattr(self.sim, '_get_current_room') else "Unknown"
+        self._rooms_visited[current_room] = self._rooms_visited.get(current_room, 0) + 1
+        if self._last_room is not None and self._last_room != current_room:
+            self._room_transitions.append((self._last_room, current_room))
+        self._last_room = current_room
 
         # Update spatial mapper (builds occupancy grid from depth + odometry)
         place_id = loc_result.token if hasattr(loc_result, 'token') else None
@@ -535,25 +623,56 @@ class FullPipelineSimulator:
         result['visible_person'] = visible_person is not None
         result['depth_map'] = depth_map
         result['depth_distances'] = depth_distances
-        result['depth_blocked'] = depth_blocked
+        result['collision_blocked'] = collision_blocked
         result['mapper_stats'] = self.spatial_mapper.get_stats()
 
         return result
 
-    def _exploration_update(self, obs: ObservationToken, loc_result) -> Dict:
+    def _exploration_update(self, obs: ObservationToken, loc_result, depth_map=None) -> Dict:
         """Run exploration mode update."""
+        # Get place ID for topological mode
+        current_place_id = loc_result.token if hasattr(loc_result, 'token') else loc_result.clone_state
+
+        if self.use_topological:
+            # Pure topological exploration - use place-graph policy
+            # Always show decision reasoning so we can understand behavior
+            action = self.topo_explorer.choose_action(self.topo_map, current_place_id, debug=True)
+
+            # Debug: print topological exploration stats periodically
+            if self._frame_count % 100 == 0:
+                stats = self.topo_map.get_stats()
+                is_stuck = self.topo_explorer.is_stuck()
+                current_room = self.sim._get_current_room() if hasattr(self.sim, '_get_current_room') else "?"
+                rooms_found = list(self._rooms_visited.keys())
+                print(f"  [TOPO-SUMMARY] places={stats['n_places']}, edges={stats['n_edges']}, "
+                      f"stuck={is_stuck}, room={current_room}, rooms_found={rooms_found}")
+
+            action_names = ['stay', 'forward', 'back', 'left', 'right',
+                           'strafe_left', 'strafe_right']
+            action_name = action_names[action] if action < len(action_names) else 'unknown'
+
+            return {
+                'action_idx': action,
+                'action_name': action_name,
+                'exploration_state': 'topological',
+                'vfe': 0.0,
+                'mean_vfe': 0.0,
+            }
+
+        # Original CSCG/EFE-based exploration
         # Use adapter so exploration sees CSCG's locations
-        explore_result = self.exploration.update(obs, self.world_model_adapter, loc_result)
+        # Pass depth_map for door-seeking behavior
+        explore_result = self.exploration.update(obs, self.world_model_adapter, loc_result, depth_map=depth_map)
 
         # Periodically run CHMM learning to update transition structure
         if self._frame_count > 0 and self._frame_count % 100 == 0:
             self.cscg.learn(n_iter=3)
 
-        # Debug: print state transition info periodically
+        # Debug: print topological exploration stats periodically
         if self.exploration._total_frames % 100 == 1:
-            print(f"  [DEBUG] rotations={self.exploration._rotations_completed}, "
-                  f"frames_in_state={self.exploration._frames_in_state}, "
-                  f"n_locations={self.world_model_adapter.n_locations}")
+            stats = self.exploration.graph.get_stats()
+            print(f"  [DEBUG] places={stats['n_places']}, frontiers={stats['n_frontiers']}, "
+                  f"edges={stats['n_edges']}, state={self.exploration._state}")
 
         # Check for transition to hunting
         if explore_result.should_transition_to_hunt:
@@ -620,6 +739,20 @@ class FullPipelineSimulator:
         self._last_action = 0
         self._frame_count = 0
         self._room_tracking.clear()
+
+        # Reset topological state
+        if self.use_topological:
+            self.topo_map = TopologicalMap()
+            self.topo_explorer.reset()
+            self._topo_prev_place = None
+            self._topo_prev_action = None
+            self._topo_prev_moved = False
+
+        # Reset room tracking
+        self._rooms_visited.clear()
+        self._room_transitions.clear()
+        self._last_room = None
+
         print("Reset complete")
 
     def _track_room(self, place_id: int, ground_truth: str, predicted: str):
@@ -885,6 +1018,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='Full Pipeline Test')
     parser.add_argument('--semantic', action='store_true', help='Use Semantic world model (EFE + priors)')
+    parser.add_argument('--topological', action='store_true', help='Use topological place-graph exploration')
     args = parser.parse_args()
 
     print("=" * 70)
@@ -894,6 +1028,7 @@ def main():
     print("World Models:")
     print("  1 - CSCG: Clone-structured cognitive graph with ORB")
     print("  2 - Semantic: EFE-based exploration with room/object priors")
+    print("  --topological: Pure place-graph exploration (camera-only)")
     print()
     print("Controls:")
     print("  SPACE   - Toggle autonomous/manual control")
@@ -910,7 +1045,8 @@ def main():
 
     # Initialize with selected model
     use_semantic = args.semantic or False
-    pipeline = FullPipelineSimulator(use_semantic=use_semantic)
+    use_topological = args.topological or False
+    pipeline = FullPipelineSimulator(use_semantic=use_semantic, use_topological=use_topological)
 
     # Create window
     cv2.namedWindow("Full Pipeline Test", cv2.WINDOW_NORMAL)
@@ -1036,6 +1172,37 @@ def main():
         print("\n  Discovered places (ORB keyframes):")
         for kf in pipeline.cscg._orb_recognizer.keyframes:
             print(f"    - {kf.name} (visited {kf.visit_count}x)")
+
+    # Topological map stats
+    if pipeline.use_topological:
+        topo_stats = pipeline.topo_map.get_stats()
+        print(f"\n  Topological Map:")
+        print(f"    Places: {topo_stats['n_places']}")
+        print(f"    Edges: {topo_stats['n_edges']}")
+        print(f"    Total visits: {topo_stats['total_visits']}")
+
+    # Room coverage analysis (for any mode)
+    if pipeline._rooms_visited:
+        all_rooms = ["Living Room", "Kitchen", "Hallway", "Bedroom", "Bathroom"]
+        visited_rooms = set(pipeline._rooms_visited.keys()) - {"Unknown"}
+        coverage = len(visited_rooms) / len(all_rooms) * 100
+
+        print(f"\n  Room Coverage Analysis:")
+        print(f"    Rooms found: {len(visited_rooms)}/{len(all_rooms)} ({coverage:.0f}%)")
+        print(f"    Visits per room:")
+        for room in all_rooms:
+            visits = pipeline._rooms_visited.get(room, 0)
+            status = "FOUND" if room in visited_rooms else "NOT VISITED"
+            print(f"      {room:15s}: {visits:4d} frames [{status}]")
+
+        if pipeline._room_transitions:
+            print(f"    Room transitions: {len(pipeline._room_transitions)}")
+            # Show unique transitions
+            unique_transitions = set(pipeline._room_transitions)
+            print(f"    Unique paths: {len(unique_transitions)}")
+            for t in sorted(unique_transitions):
+                count = pipeline._room_transitions.count(t)
+                print(f"      {t[0]:15s} -> {t[1]:15s} ({count}x)")
 
     print("=" * 70)
 

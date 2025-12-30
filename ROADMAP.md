@@ -319,32 +319,51 @@ while running:
   - Pre-flight warmup loop
   - Graceful cleanup and map save on exit
 
-### Phase 8: Exploration Mode ✓
-- [x] `pomdp/exploration_mode.py`:
-  - `ExplorationModePOMDP` class - systematic environment mapping
-  - VFE-based transition criteria (not arbitrary thresholds)
-  - State machine: SCANNING, APPROACHING_FRONTIER, BACKTRACKING, TRANSITIONING
-  - `update(obs, world_model, loc_result)` - update exploration state
-  - `should_transition_to_hunt()` - VFE + variance based decision
-  - VFE tracking via sliding window for stability detection
-  - `get_vfe_stats()` - mean and variance for diagnostics
-  - `exploration_action_to_rc_control()` - faster rotation/movement for exploration
-  - `ExplorationResult` dataclass with VFE diagnostics
-- [x] Mode switching in `person_hunter_pomdp.py`:
-  - `POMDPController.mode` - "exploration" or "hunting"
-  - `set_mode(mode, lock)` - manual mode switching
-  - Automatic transition from exploration to hunting when VFE stabilizes
-  - Keyboard controls: E = exploration, H = hunting
-  - Mode-specific visualization overlay
-- [x] Config constants in `pomdp/config.py`:
-  - `EXPLORATION_VFE_WINDOW` - frames to track VFE history
-  - `EXPLORATION_VFE_THRESHOLD` - mean VFE below this = well-modeled
-  - `EXPLORATION_VFE_VARIANCE_THRESHOLD` - variance below this = stable
-  - `EXPLORATION_EPISTEMIC_WEIGHT`, `EXPLORATION_PRAGMATIC_WEIGHT`
-  - `EXPLORATION_SCAN_YAW`, `EXPLORATION_FORWARD_FB`
-  - `EXPLORATION_STATES`, `N_EXPLORATION_STATES`
+### Phase 8: Exploration Mode ✓ (REWRITTEN Dec 2025)
 
-**Key insight:** VFE naturally captures "information gain" - when observations fit the model well (low VFE) and are stable (low variance), exploration is complete. This is more principled than arbitrary rotation counts or location thresholds.
+**Previous approach (deprecated → `legacy/exploration_mode_old.py`):**
+- Complex door-seeking with depth scanning
+- VFE-based state machine
+- Struggled to find doors and exit rooms
+
+**New approach: Topological Frontier-Based Exploration**
+
+Uses a graph of places and connections for systematic exploration:
+1. **Places** = ORB keyframe nodes (from CSCG place recognition)
+2. **Edges** = Connections discovered when moving between places
+3. **Frontier** = Places with untried movement directions
+
+**Exploration strategy:**
+```
+if current_place has untried directions:
+    try an untried direction (prefer forward > left/right > backward)
+else:
+    BFS to find nearest frontier node
+    backtrack along known edges to reach it
+```
+
+**Why this works:**
+- Naturally handles finding doors (untried directions that lead to new places)
+- Never gets stuck (always have a frontier to explore or exploration is complete)
+- Efficient coverage (BFS ensures we explore nearby frontiers first)
+- Clean graph structure enables backtracking via known paths
+
+- [x] `pomdp/exploration_mode.py` (rewritten):
+  - `ExplorationGraph` class - topological graph tracking:
+    - `edges[place][action] = destination` - known transitions
+    - `tried[place] = {actions}` - actions attempted
+    - `blocked[place] = {actions}` - walls detected
+    - `find_nearest_frontier(place)` - BFS to frontier
+    - `get_path_to(from, to)` - BFS pathfinding
+  - `ExplorationModePOMDP` class - frontier-based exploration:
+    - `update()` - records transitions, selects actions
+    - `_select_action()` - frontier or backtrack logic
+    - `record_movement_result()` - wall detection
+  - `ExplorationResult` dataclass with graph stats
+- [x] Mode switching preserved for compatibility
+- [x] Legacy code moved to `legacy/exploration_mode_old.py`
+
+**Key insight:** Topological frontier exploration is the standard approach in robotics for a reason - it's simple, robust, and complete. No need for complex depth-based door detection.
 
 ### Phase 9: Observation Encoding Improvements
 
@@ -808,7 +827,7 @@ def compute_efe(self, action):
 - [ ] `refs/` directory - Reference images for room types
 - [x] Integration in `test_full_pipeline.py` - `--semantic` flag
 
-**Completed Implementation (Dec 2024):**
+**Completed Implementation (Dec 2025):**
 
 - [x] **Layered architecture**: Semantic layer wraps CSCG (not separate)
 - [x] **Object-based room inference**: YOLO detects objects → infer room type
@@ -1037,7 +1056,7 @@ For VBGS (Phase 12) - **separate environment**:
 
 ---
 
-## Critical Bug Fixes (Dec 2024)
+## Critical Bug Fixes (Dec 2025)
 
 All fixes implemented and ready for testing.
 
@@ -1062,73 +1081,96 @@ new_val = min(255, current + self.config.free_increment)
 self.grid[y, x] = np.uint8(new_val)
 ```
 
-### Issue 2: Ellipsis in escape_actions list
+### Issue 2: Ellipsis in escape_actions list ✓ CHECKED
 **File:** `pomdp/exploration_mode.py`
 
-**Problem:** List literally contains Python `...` (Ellipsis object):
-```python
-escape_actions = [4, 4, 4, 1, 3, 3, 3, 1, 2, 2...]  # ... is Ellipsis!
-```
+**Status:** Checked - list is correct in current version (no Ellipsis bug found).
 
-**Symptoms:**
-- Weird stuck behavior
-- Actions become invalid/unhandled
-
-**Fix:** Replace with explicit int sequence.
-
-### Issue 3: Depth normalization is per-frame (unstable collision detection)
+### Issue 3: Depth normalization is per-frame (unstable collision detection) ✓ FIXED
 **File:** `utils/depth_estimator.py`
 
-**Problem:** Per-frame min/max normalization makes "blocked" threshold non-stationary:
-```python
-depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-```
+**Problem:** Per-frame min/max normalization makes "blocked" threshold non-stationary.
 
-**Symptoms:**
-- "Blocked" fluctuates even in same corridor
-- Single near pixel rescales entire map
+**Fixes Applied:**
+- Use percentiles (2nd/98th) instead of min/max for robust normalization
+- Temporal EMA smoothing of collision scores
+- Debounce "blocked" for K consecutive frames (default 3)
 
-**Fixes:**
-- Use percentiles (e.g., 20th percentile) instead of global min/max
-- Temporal EMA of collision score
-- Debounce "blocked" for K consecutive frames
-
-### Issue 4: Room classification can never predict "hallway"
+### Issue 4: Room classification can never predict "hallway" ✓ FIXED
 **File:** `mapping/semantic_world_model.py`
 
-**Problem A:** No positive evidence mapping to "hallway" in OBJECT_TO_ROOM.
+**Fixes Applied:**
+- Added hallway detection via negative evidence (few objects + many visits)
+- Added object confidence decay (objects not seen recently lose confidence)
+- Objects must be observed at least 2 times to count for room voting
+- Objects with confidence < 0.1 are removed
 
-**Problem B:** Object evidence accumulates forever per place - one "sink" detection biases place toward kitchen permanently.
-
-**Symptoms:**
-- Hallway GT → predicted kitchen/bedroom/unknown
-- Deceptively high confidence
-
-**Fixes:**
-- Add hallway priors (negative evidence: few objects + corridor shape)
-- Add recency/forgetting for objects (EMA decay)
-- Gate votes by object stability (must be observed N times)
-
-### Issue 5: ORB keyframe creation lacks spatial gating
+### Issue 5: ORB keyframe creation lacks spatial gating ✓ FIXED
 **File:** `pomdp/place_recognizer.py`
 
-**Problem:** New keyframe based on cooldown only, not spatial separation. No check for:
-- Rotation delta
-- Translation delta
-- Scene novelty
-
-**Symptoms:**
-- Many places in one hallway
-- Oscillation between small subset
-
-**Fixes:**
-- Require minimum viewpoint change (yaw delta) or translation
-- Hysteresis band: create keyframe only after M consecutive low-match frames
+**Fixes Applied:**
+- Added cumulative yaw tracking since last keyframe
+- Require minimum yaw change (~17°) OR M consecutive low-match frames (default 5)
+- Reset yaw accumulator when creating new keyframe
+- Added `yaw_delta` parameter to `recognize()` method
 
 ### Issue 6: VBGS not loading
 **Problem:** Missing `jaxtyping` dependency.
 
 **Fix:** `pip install jaxtyping`
+
+---
+
+## Collision Avoidance Module (Dec 2025)
+
+**File:** `utils/collision_avoidance.py`
+
+Implements hybrid collision avoidance combining:
+1. **Optical Flow TTC** - Fast reflex for approaching surfaces
+2. **Monocular Depth Gate** - Confirmatory gate using depth percentiles
+3. **Yaw Scan Escape** - Find open direction when stuck
+
+### Key Classes
+
+| Class | Purpose |
+|-------|---------|
+| `OpticalFlowTTC` | Computes time-to-contact from optical flow expansion |
+| `CollisionAvoidance` | Hybrid risk assessment + escape state machine |
+| `RiskLevel` | Enum: NONE, LOW, MEDIUM, HIGH, CRITICAL |
+
+### Usage
+
+```python
+from utils.collision_avoidance import create_collision_reflex
+
+# Create with depth estimator for hybrid mode
+collision = create_collision_reflex(depth_estimator=depth_estimator)
+
+# Assess risk from current frame
+state = collision.assess_risk(frame, depth_map)
+
+# Get safe action (may override desired action)
+safe_action, reason = collision.get_safe_action(desired_action, state)
+```
+
+### Collision State Machine
+
+```
+if risk >= CRITICAL:
+    emergency_backoff
+elif risk >= HIGH:
+    block forward, yaw_scan to find open direction
+elif risk >= MEDIUM:
+    pause if sustained, else proceed cautiously
+else:
+    proceed normally
+```
+
+### Why Hybrid Works
+
+- **Optical Flow** catches "approaching a surface" even if depth fails (glossy walls)
+- **Monocular Depth** catches "static near obstacles" even if flow is low
+- Combined = much more robust than either alone
 
 ---
 

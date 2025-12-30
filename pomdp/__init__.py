@@ -14,7 +14,7 @@ from .observation_encoder import (
     create_empty_observation,
     observation_to_text,
 )
-from .topological_map import TopologicalMap, LocationNode, Edge
+from .topological_map import TopologicalMap, PlaceNode, EdgeStats
 from .similarity import (
     cosine_similarity,
     weighted_cosine_similarity,

@@ -293,7 +293,7 @@ except Exception as e:
 # Test 8: Topological Map
 print("\n[8] Testing topological map...")
 try:
-    from pomdp.topological_map import TopologicalMap, LocationNode
+    from pomdp.topological_map import TopologicalMap, PlaceNode
     from pomdp.observation_encoder import create_empty_observation, ObservationToken
 
     # Create mock observations for different "rooms"

@@ -21,7 +21,7 @@ from .config import (
     VFE_HIGH_THRESHOLD, VFE_LOW_THRESHOLD, DIRICHLET_PRIOR_ALPHA,
     MIN_NOVEL_FRAMES_FOR_NEW_LOCATION,
 )
-from .topological_map import TopologicalMap, LocationNode
+from .topological_map import TopologicalMap
 from .observation_encoder import ObservationToken
 from .similarity import cosine_similarity, batch_cosine_similarity
 from .core import (

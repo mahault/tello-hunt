@@ -220,7 +220,7 @@ class CHMM:
 
         Args:
             n_clones: Number of clone states per observation token
-            n_actions: Number of action types (e.g., 5 for stay/fwd/back/left/right)
+            n_actions: Number of action types (e.g., 7 for stay/fwd/back/left/right/strafe_left/strafe_right)
             pseudocount: Dirichlet prior for smoothing
             seed: Random seed for initialization
         """

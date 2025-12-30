@@ -87,7 +87,7 @@ class CSCGWorldModel:
         self,
         n_tokens: int = 32,
         n_clones_per_token: int = 3,
-        n_actions: int = 5,
+        n_actions: int = 7,  # stay, fwd, back, left, right, strafe_left, strafe_right
         embedding_dim: int = 384,  # DINOv2-small default
         similarity_threshold: float = 0.85,
         use_hybrid_tokenizer: bool = False,  # Disabled by default for ORB
@@ -101,7 +101,7 @@ class CSCGWorldModel:
         Args:
             n_tokens: Maximum observation tokens
             n_clones_per_token: Clone states per token (for aliasing disambiguation)
-            n_actions: Number of action types (e.g., stay/fwd/back/left/right)
+            n_actions: Number of action types (0=stay, 1=fwd, 2=back, 3=left, 4=right, 5=strafe_left, 6=strafe_right)
             embedding_dim: Embedding dimension (512 for CLIP, 384 for DINOv2-small)
             similarity_threshold: Token assignment threshold
             use_hybrid_tokenizer: Use encoder + YOLO hybrid tokens (ignored for ORB)
