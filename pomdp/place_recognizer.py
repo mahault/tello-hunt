@@ -70,9 +70,11 @@ class ORBPlaceRecognizer:
 
         # Spatial gating for keyframe creation
         self._cumulative_yaw_change: float = 0.0  # Radians since last keyframe
+        self._cumulative_translation: float = 0.0  # Distance since last keyframe
         self._consecutive_low_matches: int = 0  # Frames with no good match
-        self._min_yaw_for_new_keyframe: float = 0.3  # ~17 degrees
-        self._min_low_match_frames: int = 5  # Require M consecutive low-match frames
+        self._min_yaw_for_new_keyframe: float = 0.5  # ~30 degrees (increased)
+        self._min_translation_for_new_keyframe: float = 50.0  # Min distance to create new place
+        self._min_low_match_frames: int = 8  # Require M consecutive low-match frames (increased)
 
     def preload_room(
         self,
@@ -145,6 +147,7 @@ class ORBPlaceRecognizer:
         frame: np.ndarray,
         allow_new: bool = True,
         yaw_delta: float = 0.0,
+        translation_delta: float = 0.0,
         debug: bool = False,
     ) -> Tuple[int, str, float, bool]:
         """
@@ -154,6 +157,7 @@ class ORBPlaceRecognizer:
             frame: BGR image
             allow_new: Allow creating new keyframes
             yaw_delta: Yaw change since last frame (radians) for spatial gating
+            translation_delta: Translation since last frame (scene units) for spatial gating
             debug: Print debug info
 
         Returns:
@@ -162,6 +166,7 @@ class ORBPlaceRecognizer:
         self._frame_count += 1
         self._frames_since_keyframe += 1
         self._cumulative_yaw_change += abs(yaw_delta)
+        self._cumulative_translation += abs(translation_delta)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
         keypoints, descriptors = self.orb.detectAndCompute(gray, None)
@@ -206,14 +211,17 @@ class ORBPlaceRecognizer:
 
             # Check if we should create new keyframe with spatial gating:
             # 1. Cooldown passed
-            # 2. Either significant yaw change OR many consecutive low-match frames
+            # 2. Significant translation (we actually MOVED to a new place)
+            # 3. Either significant yaw change OR many consecutive low-match frames
+            has_translation = self._cumulative_translation >= self._min_translation_for_new_keyframe
+            has_yaw_change = self._cumulative_yaw_change >= self._min_yaw_for_new_keyframe
+            has_low_matches = self._consecutive_low_matches >= self._min_low_match_frames
+
             can_create = (
                 allow_new and
                 self._frames_since_keyframe >= self.keyframe_cooldown and
-                (
-                    self._cumulative_yaw_change >= self._min_yaw_for_new_keyframe or
-                    self._consecutive_low_matches >= self._min_low_match_frames
-                )
+                has_translation and  # REQUIRE translation - no new place from just rotating!
+                (has_yaw_change or has_low_matches)
             )
 
             if can_create:
@@ -224,9 +232,12 @@ class ORBPlaceRecognizer:
                 is_new = True
                 # Reset counters
                 self._consecutive_low_matches = 0
+                self._cumulative_translation = 0.0
+                self._cumulative_yaw_change = 0.0
 
                 if debug:
-                    print(f"  [ORB] New place '{place_name}' (best was {best_matches} matches, yaw_change={np.degrees(self._cumulative_yaw_change):.1f}°)")
+                    print(f"  [ORB] New place '{place_name}' (best was {best_matches} matches, "
+                          f"translation={self._cumulative_translation:.0f}, yaw={np.degrees(self._cumulative_yaw_change):.1f}°)")
 
             else:
                 # Stay at current

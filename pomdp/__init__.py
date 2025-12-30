@@ -61,3 +61,6 @@ from .image_encoder import (
     find_most_similar_embedding,
     CLIP_EMBEDDING_DIM,
 )
+from .topological_explorer import TopologicalExplorer
+from .look_ahead_explorer import LookAheadExplorer, FrontierDetector
+from .frontier_explorer import FrontierExplorer

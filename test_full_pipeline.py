@@ -97,6 +97,10 @@ from utils.occupancy_map import SpatialMapper
 # Topological exploration (pure camera-only approach)
 from pomdp.topological_map import TopologicalMap
 from pomdp.topological_explorer import TopologicalExplorer
+from pomdp.look_ahead_explorer import LookAheadExplorer, FrontierDetector
+
+# Frontier-based exploration (canonical robotics approach)
+from pomdp.frontier_explorer import FrontierExplorer
 
 # For fake YOLO detections
 from dataclasses import dataclass
@@ -199,10 +203,12 @@ class FullPipelineSimulator:
     - Semantic: EFE-based exploration with room/object priors
     """
 
-    def __init__(self, use_glb: bool = True, use_semantic: bool = False, use_topological: bool = False):
+    def __init__(self, use_glb: bool = True, use_semantic: bool = False, use_topological: bool = False, use_lookahead: bool = False, use_frontier: bool = False):
         # 3D Simulator - prefer GLB for realistic textures
         self.use_glb = use_glb and HAS_GLB
         self.use_topological = use_topological
+        self.use_lookahead = use_lookahead
+        self.use_frontier = use_frontier
         if self.use_glb:
             print("Using GLB simulator (realistic textures for ORB)")
             self.sim = GLBSimulator(width=640, height=480)
@@ -273,8 +279,9 @@ class FullPipelineSimulator:
             print("YOLO ready!")
 
         # Monocular depth estimation (realistic - same as real drone)
+        # Always enable depth if available - needed for spatial mapper and collision avoidance
         self.depth_estimator = None
-        self.use_depth = HAS_DEPTH and self.use_semantic
+        self.use_depth = HAS_DEPTH
         if self.use_depth:
             print("Loading depth estimator (Depth Anything)...")
             self.depth_estimator = DepthEstimator(model_type="depth_anything")
@@ -302,6 +309,33 @@ class FullPipelineSimulator:
             self._topo_prev_action = None
             self._topo_prev_moved = False
 
+        # Look-ahead exploration (heading evaluation before moving)
+        if self.use_lookahead:
+            print("Initializing Look-Ahead Explorer (heading evaluation)...")
+            self.lookahead_explorer = LookAheadExplorer(
+                w_safety=2.0,
+                w_novelty=1.5,
+                w_goal=1.0,
+                w_turn=0.3,
+                hallway_progress_weight=0.5,
+            )
+            self.frontier_detector = FrontierDetector()
+            # Also initialize topo map for novelty tracking
+            if not self.use_topological:
+                self.topo_map = TopologicalMap()
+                self._topo_prev_place = None
+                self._topo_prev_action = None
+                self._topo_prev_moved = False
+
+        # Frontier-based exploration (canonical robotics approach)
+        if self.use_frontier:
+            print("Initializing Frontier Explorer (canonical robotics)...")
+            self.frontier_explorer = FrontierExplorer(
+                reached_threshold=0.3,
+                heading_tolerance=0.35,
+                min_frontier_distance=0.2,
+            )
+
         # Mode
         self.mode = "exploration"
         self.autonomous = True
@@ -322,8 +356,17 @@ class FullPipelineSimulator:
         self._room_transitions: List[Tuple[str, str]] = []  # (from_room, to_room)
         self._last_room: str = None
 
-        model_type = "Semantic (EFE)" if self.use_semantic else "CSCG (ORB)"
-        print(f"Ready! ({model_type} world model)")
+        if self.use_frontier:
+            model_type = "Frontier (canonical robotics)"
+        elif self.use_lookahead:
+            model_type = "Look-Ahead (heading evaluation)"
+        elif self.use_topological:
+            model_type = "Topological (place-graph)"
+        elif self.use_semantic:
+            model_type = "Semantic (EFE)"
+        else:
+            model_type = "CSCG (ORB)"
+        print(f"Ready! ({model_type} exploration)")
 
     def add_person(self, room_name: str = None):
         """Add a simulated person."""
@@ -477,10 +520,15 @@ class FullPipelineSimulator:
             self._track_room(place_id, ground_truth, predicted)
         else:
             # CSCG localization
+            # Pass position and yaw for translation-based place gating
+            position = (self.sim.x, self.sim.y, self.sim.z) if self.use_glb else None
+            yaw = self.sim.yaw if self.use_glb else 0.0
             loc_result = self.cscg.localize(
                 frame=frame,
                 action_taken=self._last_action,
                 observation_token=obs,
+                position=position,
+                yaw=yaw,
             )
 
             # Update spatial map
@@ -587,12 +635,23 @@ class FullPipelineSimulator:
             if action in [1, 2, 5, 6]:  # All movement actions (forward, back, strafe)
                 self.topo_explorer.record_block(was_blocked)
 
+        # Inform look-ahead explorer about blocked movements
+        if self.use_lookahead:
+            was_blocked = not moved or collision_blocked
+            if action in [1, 2, 5, 6]:  # All movement actions
+                self.lookahead_explorer.record_block(was_blocked)
+
         # Track room visits for analysis
         current_room = self.sim._get_current_room() if hasattr(self.sim, '_get_current_room') else "Unknown"
         self._rooms_visited[current_room] = self._rooms_visited.get(current_room, 0) + 1
         if self._last_room is not None and self._last_room != current_room:
             self._room_transitions.append((self._last_room, current_room))
         self._last_room = current_room
+
+        # Update topological explorer with room and heading info
+        if self.use_topological:
+            self.topo_explorer.update_room(current_room)
+            self.topo_explorer.update_heading(self.sim.yaw if self.use_glb else 0.0)
 
         # Update spatial mapper (builds occupancy grid from depth + odometry)
         place_id = loc_result.token if hasattr(loc_result, 'token') else None
@@ -633,6 +692,111 @@ class FullPipelineSimulator:
         # Get place ID for topological mode
         current_place_id = loc_result.token if hasattr(loc_result, 'token') else loc_result.clone_state
 
+        # === FRONTIER-BASED EXPLORATION ===
+        if self.use_frontier:
+            # Get current pose from spatial mapper
+            pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()
+
+            # CRITICAL: Update occupancy grid from depth BEFORE making decision
+            # (The main spatial_mapper.update happens after action, but we need
+            # current observations to find frontiers correctly)
+            if depth_map is not None:
+                self.spatial_mapper.map.update_from_depth(
+                    depth_map, pose_x, pose_y, pose_yaw, max_range=3.0
+                )
+
+            # Choose action using frontier-based policy
+            debug_this_frame = (self._frame_count % 30 == 0)
+            action = self.frontier_explorer.choose_action(
+                grid=self.spatial_mapper.map.grid,
+                agent_x=pose_x,
+                agent_y=pose_y,
+                agent_yaw=pose_yaw,
+                world_to_map_fn=self.spatial_mapper.map.world_to_map,
+                map_to_world_fn=self.spatial_mapper.map.map_to_world,
+                debug=debug_this_frame,
+            )
+
+            # Check if exploration is complete
+            if self.frontier_explorer.exploration_complete:
+                print("\n" + "=" * 50)
+                print("EXPLORATION COMPLETE - No frontiers remaining!")
+                print("=" * 50 + "\n")
+
+            # Debug: print stats periodically
+            if self._frame_count % 100 == 0:
+                current_room = self.sim._get_current_room() if hasattr(self.sim, '_get_current_room') else "?"
+                rooms_found = list(self._rooms_visited.keys())
+                n_frontiers = self.frontier_explorer.get_frontier_count()
+                mapper_stats = self.spatial_mapper.get_stats()
+                target = self.frontier_explorer.target
+                target_str = f"({target[0]:.1f}, {target[1]:.1f})" if target else "none"
+                print(f"  [FRONTIER] room={current_room}, rooms_found={rooms_found}, "
+                      f"frontiers={n_frontiers}, target={target_str}, "
+                      f"mapped={mapper_stats.get('explored_pct', 0):.1f}%")
+
+            action_names = ['stay', 'forward', 'back', 'left', 'right',
+                           'strafe_left', 'strafe_right']
+            action_name = action_names[action] if action < len(action_names) else 'unknown'
+
+            return {
+                'action_idx': action,
+                'action_name': action_name,
+                'exploration_state': 'frontier',
+                'vfe': 0.0,
+                'mean_vfe': 0.0,
+            }
+
+        # === LOOK-AHEAD EXPLORATION ===
+        if self.use_lookahead:
+            # Update explorer with current state
+            self.lookahead_explorer.update_heading(self.sim.yaw if self.use_glb else 0.0)
+            self.lookahead_explorer.update_depth(depth_map)
+
+            if self.use_glb:
+                self.lookahead_explorer.update_position(self.sim.x, self.sim.y, self.sim.z)
+
+            # Detect frontiers from occupancy map
+            if hasattr(self, 'spatial_mapper') and depth_map is not None:
+                pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()
+                cx, cy = self.spatial_mapper.map.world_to_map(pose_x, pose_y)
+                frontier_dir, frontier_dist = self.frontier_detector.find_frontier(
+                    self.spatial_mapper.map.grid,
+                    (cx, cy),
+                    pose_yaw
+                )
+                self.lookahead_explorer.update_frontier(frontier_dir, frontier_dist)
+
+            # Choose action using look-ahead evaluation
+            debug_this_frame = (self._frame_count % 30 == 0)
+            action = self.lookahead_explorer.choose_action(
+                topo_map=self.topo_map if hasattr(self, 'topo_map') else None,
+                place_id=current_place_id,
+                debug=debug_this_frame
+            )
+
+            # Debug: print stats periodically
+            if self._frame_count % 100 == 0:
+                current_room = self.sim._get_current_room() if hasattr(self.sim, '_get_current_room') else "?"
+                rooms_found = list(self._rooms_visited.keys())
+                mapper_stats = self.spatial_mapper.get_stats() if hasattr(self, 'spatial_mapper') else {}
+                print(f"  [LOOK-AHEAD] phase={self.lookahead_explorer.state.phase}, "
+                      f"room={current_room}, rooms_found={rooms_found}, "
+                      f"mapped={mapper_stats.get('explored_pct', 0):.1f}%")
+
+            action_names = ['stay', 'forward', 'back', 'left', 'right',
+                           'strafe_left', 'strafe_right']
+            action_name = action_names[action] if action < len(action_names) else 'unknown'
+
+            return {
+                'action_idx': action,
+                'action_name': action_name,
+                'exploration_state': f'lookahead_{self.lookahead_explorer.state.phase}',
+                'vfe': 0.0,
+                'mean_vfe': 0.0,
+            }
+
+        # === TOPOLOGICAL EXPLORATION ===
         if self.use_topological:
             # Pure topological exploration - use place-graph policy
             # Always show decision reasoning so we can understand behavior
@@ -747,6 +911,19 @@ class FullPipelineSimulator:
             self._topo_prev_place = None
             self._topo_prev_action = None
             self._topo_prev_moved = False
+
+        # Reset look-ahead explorer
+        if self.use_lookahead:
+            self.lookahead_explorer.reset()
+            if not self.use_topological:
+                self.topo_map = TopologicalMap()
+                self._topo_prev_place = None
+                self._topo_prev_action = None
+                self._topo_prev_moved = False
+
+        # Reset frontier explorer
+        if self.use_frontier:
+            self.frontier_explorer.reset()
 
         # Reset room tracking
         self._rooms_visited.clear()
@@ -1019,6 +1196,8 @@ def main():
     parser = argparse.ArgumentParser(description='Full Pipeline Test')
     parser.add_argument('--semantic', action='store_true', help='Use Semantic world model (EFE + priors)')
     parser.add_argument('--topological', action='store_true', help='Use topological place-graph exploration')
+    parser.add_argument('--lookahead', action='store_true', help='Use look-ahead exploration (heading evaluation)')
+    parser.add_argument('--frontier', action='store_true', help='Use frontier-based exploration (canonical robotics)')
     args = parser.parse_args()
 
     print("=" * 70)
@@ -1029,6 +1208,8 @@ def main():
     print("  1 - CSCG: Clone-structured cognitive graph with ORB")
     print("  2 - Semantic: EFE-based exploration with room/object priors")
     print("  --topological: Pure place-graph exploration (camera-only)")
+    print("  --lookahead: Look-ahead exploration (heading evaluation before moving)")
+    print("  --frontier: Frontier-based exploration (canonical robotics approach)")
     print()
     print("Controls:")
     print("  SPACE   - Toggle autonomous/manual control")
@@ -1046,7 +1227,9 @@ def main():
     # Initialize with selected model
     use_semantic = args.semantic or False
     use_topological = args.topological or False
-    pipeline = FullPipelineSimulator(use_semantic=use_semantic, use_topological=use_topological)
+    use_lookahead = args.lookahead or False
+    use_frontier = args.frontier or False
+    pipeline = FullPipelineSimulator(use_semantic=use_semantic, use_topological=use_topological, use_lookahead=use_lookahead, use_frontier=use_frontier)
 
     # Create window
     cv2.namedWindow("Full Pipeline Test", cv2.WINDOW_NORMAL)

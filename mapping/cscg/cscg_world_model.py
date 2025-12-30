@@ -162,6 +162,11 @@ class CSCGWorldModel:
 
         # Previous state for transition tracking
         self._prev_token: int = -1
+
+        # Position tracking for translation-based place gating
+        self._last_position: Optional[Tuple[float, float, float]] = None
+        self._last_yaw: float = 0.0
+        self._move_distance = 30.0  # Estimated distance per move action (scene units)
         self._prev_action: int = 0
 
         # Sequence buffer for batch learning
@@ -239,6 +244,8 @@ class CSCGWorldModel:
         frame: np.ndarray,
         action_taken: int = 0,
         observation_token: Optional['ObservationToken'] = None,
+        position: Optional[Tuple[float, float, float]] = None,
+        yaw: float = 0.0,
         debug: bool = False,
     ) -> CSCGLocalizationResult:
         """
@@ -248,6 +255,8 @@ class CSCGWorldModel:
             frame: BGR image frame
             action_taken: Movement action taken (0=stay, 1=fwd, 2=back, 3=left, 4=right)
             observation_token: Optional YOLO observation token (for hybrid tokenizer)
+            position: Optional (x, y, z) position for translation-based place gating
+            yaw: Current yaw angle (radians)
             debug: Print debug info
 
         Returns:
@@ -255,11 +264,31 @@ class CSCGWorldModel:
         """
         self._frame_count = getattr(self, '_frame_count', 0) + 1
 
+        # Compute translation and yaw deltas for place gating
+        translation_delta = 0.0
+        yaw_delta = 0.0
+
+        if position is not None and self._last_position is not None:
+            dx = position[0] - self._last_position[0]
+            dy = position[1] - self._last_position[1]
+            dz = position[2] - self._last_position[2]
+            translation_delta = np.sqrt(dx*dx + dy*dy + dz*dz)
+        elif action_taken in [1, 2, 5, 6]:  # Movement actions
+            # Estimate translation from action
+            translation_delta = self._move_distance
+
+        yaw_delta = yaw - self._last_yaw if self._last_yaw != 0 else 0.0
+
+        # Update position tracking
+        if position is not None:
+            self._last_position = position
+        self._last_yaw = yaw
+
         # Tokenization depends on encoder type
         if self.use_orb:
             # ORB-based tokenization (RECOMMENDED)
             place_id, place_name, confidence, is_new = self._orb_recognizer.recognize(
-                frame, allow_new=True, debug=debug
+                frame, allow_new=True, yaw_delta=yaw_delta, translation_delta=translation_delta, debug=debug
             )
             token = place_id
             token_sim = confidence
