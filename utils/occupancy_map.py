@@ -225,7 +225,8 @@ class OccupancyMap:
         if not self.is_valid_cell(x, y):
             return
 
-        current = self.grid[y, x]
+        # Convert to int to avoid uint8 overflow before min/max
+        current = int(self.grid[y, x])
         self.visit_count[y, x] += 1
 
         if free:
@@ -235,7 +236,7 @@ class OccupancyMap:
             # Increase occupied confidence
             new_val = max(0, current - self.config.occupied_increment)
 
-        self.grid[y, x] = new_val
+        self.grid[y, x] = np.uint8(new_val)
 
     def mark_place(self, place_id: int, x: float, y: float, label: str = None):
         """

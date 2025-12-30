@@ -46,6 +46,7 @@ class ObjectInstance:
     area: float  # Normalized area
     confidence: float
     visit_count: int = 1
+    frames_since_seen: int = 0  # For recency/decay
 
     def update(self, pos: Tuple[float, float], area: float, conf: float):
         """Update object with new observation."""
@@ -58,6 +59,13 @@ class ObjectInstance:
         self.area = self.area * (1 - alpha) + area * alpha
         self.confidence = max(self.confidence, conf)
         self.visit_count += 1
+        self.frames_since_seen = 0  # Reset decay counter
+
+    def apply_decay(self, decay_rate: float = 0.95):
+        """Apply confidence decay for objects not recently seen."""
+        self.frames_since_seen += 1
+        if self.frames_since_seen > 10:  # Start decay after 10 frames
+            self.confidence *= decay_rate
 
 
 @dataclass
@@ -317,18 +325,40 @@ class SemanticWorldModel:
             return
 
         place = self.places[place_id]
-        if not place.objects:
-            return
+
+        # Apply decay to all objects not seen this frame
+        for obj in place.objects.values():
+            obj.apply_decay()
+
+        # Remove objects with very low confidence (decayed away)
+        place.objects = {
+            name: obj for name, obj in place.objects.items()
+            if obj.confidence > 0.1
+        }
 
         # Count votes for each room type based on objects
+        # Only count objects seen multiple times (stability filter)
         room_votes = {}
-        for obj_name in place.objects.keys():
+        for obj_name, obj in place.objects.items():
+            if obj.visit_count < 2:  # Require at least 2 observations
+                continue
+
             room_type = self.OBJECT_TO_ROOM.get(obj_name)
             if room_type:
                 if room_type not in room_votes:
                     room_votes[room_type] = 0
                 # Weight by object confidence
-                room_votes[room_type] += place.objects[obj_name].confidence
+                room_votes[room_type] += obj.confidence
+
+        # HALLWAY DETECTION: negative evidence (few objects + many visits)
+        # If we've visited this place many times and found few distinctive objects,
+        # it's likely a hallway or corridor
+        if place.visit_count >= 10 and len(place.objects) <= 2:
+            distinctive_objects = [o for o in place.objects.keys()
+                                  if o in self.OBJECT_TO_ROOM]
+            if len(distinctive_objects) == 0:
+                # No distinctive objects after many visits -> likely hallway
+                room_votes['hallway'] = room_votes.get('hallway', 0) + 0.5
 
         if not room_votes:
             return
@@ -336,7 +366,7 @@ class SemanticWorldModel:
         # Find best room type
         best_type = max(room_votes, key=room_votes.get)
         total_weight = sum(room_votes.values())
-        confidence = room_votes[best_type] / total_weight
+        confidence = room_votes[best_type] / total_weight if total_weight > 0 else 0
 
         # Update room type if confident enough
         if confidence > 0.4:  # Lower threshold since object detection is reliable

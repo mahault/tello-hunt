@@ -21,6 +21,9 @@ class DepthEstimator:
 
     Estimates relative depth (not metric) from single frames.
     For metric depth, would need camera calibration + scale factor.
+
+    Uses robust normalization (percentiles) and temporal smoothing
+    for stable collision detection.
     """
 
     def __init__(self, model_type: str = "depth_anything", device: str = "auto"):
@@ -35,6 +38,12 @@ class DepthEstimator:
         self.model = None
         self.transform = None
         self.device = None
+
+        # Temporal smoothing for stable collision detection
+        self._collision_ema: Dict[str, float] = {}  # EMA per region
+        self._ema_alpha = 0.3  # Smoothing factor (0=slow, 1=instant)
+        self._blocked_count: Dict[str, int] = {}  # Debounce counters
+        self._blocked_threshold = 3  # Frames to confirm blocked
 
         # Try to load the requested model
         self._load_model(model_type, device)
@@ -121,9 +130,11 @@ class DepthEstimator:
         result = self.pipe(pil_image)
         depth = np.array(result["depth"])
 
-        # Normalize to 0-1 (invert so near=1, far=0)
+        # Robust normalization using percentiles (not min/max)
+        # This prevents single outlier pixels from rescaling the whole map
         depth = depth.astype(np.float32)
-        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+        p2, p98 = np.percentile(depth, [2, 98])
+        depth = np.clip((depth - p2) / (p98 - p2 + 1e-8), 0, 1)
 
         # Resize to match input frame
         if depth.shape[:2] != frame.shape[:2]:
@@ -153,8 +164,10 @@ class DepthEstimator:
 
         depth = prediction.cpu().numpy()
 
-        # Normalize to 0-1 (MiDaS outputs inverse depth, so near=high)
-        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+        # Robust normalization using percentiles (not min/max)
+        # MiDaS outputs inverse depth, so near=high
+        p2, p98 = np.percentile(depth, [2, 98])
+        depth = np.clip((depth - p2) / (p98 - p2 + 1e-8), 0, 1)
 
         return depth
 
@@ -219,13 +232,15 @@ class DepthEstimator:
         """
         Check if path is clear in given direction.
 
+        Uses temporal EMA smoothing and debouncing for stable detection.
+
         Args:
             depth: Depth map from estimate()
             direction: "forward", "left", "right", "up", "down"
             threshold: Minimum distance (0-1) to consider clear
 
         Returns:
-            (is_clear, distance) tuple
+            (is_clear, smoothed_distance) tuple
         """
         distances = self.get_obstacle_distances(depth)
 
@@ -238,9 +253,33 @@ class DepthEstimator:
         }
 
         region = direction_map.get(direction, 'center')
-        distance = distances.get(region, 0.0)
+        raw_distance = distances.get(region, 0.0)
 
-        return distance > threshold, distance
+        # Apply temporal EMA smoothing
+        if region not in self._collision_ema:
+            self._collision_ema[region] = raw_distance
+        else:
+            self._collision_ema[region] = (
+                self._ema_alpha * raw_distance +
+                (1 - self._ema_alpha) * self._collision_ema[region]
+            )
+
+        smoothed_distance = self._collision_ema[region]
+
+        # Debounce: require K consecutive frames to confirm blocked
+        if region not in self._blocked_count:
+            self._blocked_count[region] = 0
+
+        if smoothed_distance < threshold:
+            self._blocked_count[region] += 1
+        else:
+            self._blocked_count[region] = max(0, self._blocked_count[region] - 1)
+
+        # Only report blocked if debounce threshold met
+        is_blocked = self._blocked_count[region] >= self._blocked_threshold
+        is_clear = not is_blocked
+
+        return is_clear, smoothed_distance
 
     def visualize_depth(
         self,

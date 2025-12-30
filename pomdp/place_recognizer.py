@@ -68,6 +68,12 @@ class ORBPlaceRecognizer:
         self._current_name: str = "Unknown"
         self._frame_count: int = 0
 
+        # Spatial gating for keyframe creation
+        self._cumulative_yaw_change: float = 0.0  # Radians since last keyframe
+        self._consecutive_low_matches: int = 0  # Frames with no good match
+        self._min_yaw_for_new_keyframe: float = 0.3  # ~17 degrees
+        self._min_low_match_frames: int = 5  # Require M consecutive low-match frames
+
     def preload_room(
         self,
         frames: List[np.ndarray],
@@ -138,6 +144,7 @@ class ORBPlaceRecognizer:
         self,
         frame: np.ndarray,
         allow_new: bool = True,
+        yaw_delta: float = 0.0,
         debug: bool = False,
     ) -> Tuple[int, str, float, bool]:
         """
@@ -146,6 +153,7 @@ class ORBPlaceRecognizer:
         Args:
             frame: BGR image
             allow_new: Allow creating new keyframes
+            yaw_delta: Yaw change since last frame (radians) for spatial gating
             debug: Print debug info
 
         Returns:
@@ -153,6 +161,7 @@ class ORBPlaceRecognizer:
         """
         self._frame_count += 1
         self._frames_since_keyframe += 1
+        self._cumulative_yaw_change += abs(yaw_delta)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
         keypoints, descriptors = self.orb.detectAndCompute(gray, None)
@@ -177,7 +186,8 @@ class ORBPlaceRecognizer:
         is_new = False
 
         if best_matches >= self.min_matches:
-            # Good match
+            # Good match - reset low-match counter
+            self._consecutive_low_matches = 0
             place_id = best_id
             place_name = best_name
 
@@ -190,23 +200,41 @@ class ORBPlaceRecognizer:
             if debug and (self._frame_count % 30 == 0 or place_id != self._current_place):
                 print(f"  [ORB] Matched '{place_name}' ({best_matches} matches, conf={confidence:.2f})")
 
-        elif allow_new and self._frames_since_keyframe >= self.keyframe_cooldown:
-            # Create new keyframe
-            place_id = self._create_keyframe(descriptors, keypoints, gray, f"Place_{self._next_id}")
-            place_name = self._current_name
-            confidence = 1.0
-            is_new = True
-
-            if debug:
-                print(f"  [ORB] New place '{place_name}' (best was {best_matches} matches)")
-
         else:
-            # Stay at current
-            place_id = self._current_place if self._current_place >= 0 else best_id
-            place_name = self._current_name if self._current_place >= 0 else best_name
+            # Low match - increment counter
+            self._consecutive_low_matches += 1
 
-            if debug and self._frame_count % 60 == 0:
-                print(f"  [ORB] Uncertain, staying at '{place_name}'")
+            # Check if we should create new keyframe with spatial gating:
+            # 1. Cooldown passed
+            # 2. Either significant yaw change OR many consecutive low-match frames
+            can_create = (
+                allow_new and
+                self._frames_since_keyframe >= self.keyframe_cooldown and
+                (
+                    self._cumulative_yaw_change >= self._min_yaw_for_new_keyframe or
+                    self._consecutive_low_matches >= self._min_low_match_frames
+                )
+            )
+
+            if can_create:
+                # Create new keyframe
+                place_id = self._create_keyframe(descriptors, keypoints, gray, f"Place_{self._next_id}")
+                place_name = self._current_name
+                confidence = 1.0
+                is_new = True
+                # Reset counters
+                self._consecutive_low_matches = 0
+
+                if debug:
+                    print(f"  [ORB] New place '{place_name}' (best was {best_matches} matches, yaw_change={np.degrees(self._cumulative_yaw_change):.1f}°)")
+
+            else:
+                # Stay at current
+                place_id = self._current_place if self._current_place >= 0 else best_id
+                place_name = self._current_name if self._current_place >= 0 else best_name
+
+                if debug and self._frame_count % 60 == 0:
+                    print(f"  [ORB] Uncertain, staying at '{place_name}' (low_match_count={self._consecutive_low_matches})")
 
         self._current_place = place_id
         self._current_name = place_name
@@ -272,6 +300,7 @@ class ORBPlaceRecognizer:
         place_id = self._next_id
         self._next_id += 1
         self._frames_since_keyframe = 0
+        self._cumulative_yaw_change = 0.0  # Reset yaw accumulator
         self._current_place = place_id
         self._current_name = name
 

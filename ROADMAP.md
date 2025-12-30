@@ -1037,6 +1037,101 @@ For VBGS (Phase 12) - **separate environment**:
 
 ---
 
+## Critical Bug Fixes (Dec 2024)
+
+All fixes implemented and ready for testing.
+
+### Issue 1: Occupancy map uint8 overflow ✓ FIXED
+**File:** `utils/occupancy_map.py`
+
+**Problem:** Grid stored as `dtype=np.uint8`, arithmetic wraps around before `min/max` clamp.
+```python
+current = self.grid[y, x]  # uint8
+new_val = min(255, current + free_increment)  # WRAPS before min!
+```
+
+**Symptoms:**
+- Free cells suddenly look occupied (or vice versa)
+- Frontier/exploration heuristics unstable
+- "Blocked everywhere" / oscillation common
+
+**Fix:** Convert to int before arithmetic:
+```python
+current = int(self.grid[y, x])
+new_val = min(255, current + self.config.free_increment)
+self.grid[y, x] = np.uint8(new_val)
+```
+
+### Issue 2: Ellipsis in escape_actions list
+**File:** `pomdp/exploration_mode.py`
+
+**Problem:** List literally contains Python `...` (Ellipsis object):
+```python
+escape_actions = [4, 4, 4, 1, 3, 3, 3, 1, 2, 2...]  # ... is Ellipsis!
+```
+
+**Symptoms:**
+- Weird stuck behavior
+- Actions become invalid/unhandled
+
+**Fix:** Replace with explicit int sequence.
+
+### Issue 3: Depth normalization is per-frame (unstable collision detection)
+**File:** `utils/depth_estimator.py`
+
+**Problem:** Per-frame min/max normalization makes "blocked" threshold non-stationary:
+```python
+depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+```
+
+**Symptoms:**
+- "Blocked" fluctuates even in same corridor
+- Single near pixel rescales entire map
+
+**Fixes:**
+- Use percentiles (e.g., 20th percentile) instead of global min/max
+- Temporal EMA of collision score
+- Debounce "blocked" for K consecutive frames
+
+### Issue 4: Room classification can never predict "hallway"
+**File:** `mapping/semantic_world_model.py`
+
+**Problem A:** No positive evidence mapping to "hallway" in OBJECT_TO_ROOM.
+
+**Problem B:** Object evidence accumulates forever per place - one "sink" detection biases place toward kitchen permanently.
+
+**Symptoms:**
+- Hallway GT → predicted kitchen/bedroom/unknown
+- Deceptively high confidence
+
+**Fixes:**
+- Add hallway priors (negative evidence: few objects + corridor shape)
+- Add recency/forgetting for objects (EMA decay)
+- Gate votes by object stability (must be observed N times)
+
+### Issue 5: ORB keyframe creation lacks spatial gating
+**File:** `pomdp/place_recognizer.py`
+
+**Problem:** New keyframe based on cooldown only, not spatial separation. No check for:
+- Rotation delta
+- Translation delta
+- Scene novelty
+
+**Symptoms:**
+- Many places in one hallway
+- Oscillation between small subset
+
+**Fixes:**
+- Require minimum viewpoint change (yaw delta) or translation
+- Hysteresis band: create keyframe only after M consecutive low-match frames
+
+### Issue 6: VBGS not loading
+**Problem:** Missing `jaxtyping` dependency.
+
+**Fix:** `pip install jaxtyping`
+
+---
+
 ## Research References
 
 - [Bio-Inspired Topological Autonomous Navigation with Active Inference](https://arxiv.org/html/2508.07267) - Ghent University / VERSES. Core approach for incremental topological mapping, localization via observation matching, EFE-guided exploration.
