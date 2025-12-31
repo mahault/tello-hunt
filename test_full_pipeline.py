@@ -828,42 +828,52 @@ class FullPipelineSimulator:
 
         # === FRONTIER-BASED EXPLORATION ===
         if self.use_frontier:
-            # CRITICAL FIX: Use simulator's ACTUAL pose, not odometry!
-            # The odometry uses a different yaw convention which causes backward movement.
-            #
-            # Simulator convention:
-            #   Forward = (sin(yaw), -cos(yaw)) in (x, z)
-            #   yaw=0 → facing -Z direction
-            #
-            # Frontier explorer (atan2) convention:
-            #   Forward = (cos(yaw), sin(yaw)) in (x, y)
-            #   yaw=0 → facing +X direction
-            #
-            # Mapping: sim.x → world.x, sim.z → world.y (note: NOT negated)
-            #          sim.yaw → world.yaw - π/2 (rotate 90° CCW)
             if self.use_glb:
-                # Use simulator's ground truth pose with coordinate transform
-                world_x = self.sim.x / 100.0  # Convert to meters (rough scale)
-                world_y = self.sim.z / 100.0  # Map z to y
-                # Transform yaw: simulator yaw=0 means facing -Z
-                # In the occupancy grid, we want yaw=0 to mean facing +X
-                # So we need: world_yaw = sim_yaw - π/2
-                world_yaw = self.sim.yaw - math.pi / 2
+                # CORRECT coordinate transform: GLB → "x=forward, y=right"
+                #
+                # GLB simulator convention:
+                #   - yaw=0 faces -Z direction
+                #   - Forward motion at yaw=0 moves toward -Z
+                #   - +X is to the right when facing -Z
+                #
+                # OccupancyMap/frontier explorer expects:
+                #   - x = forward direction
+                #   - y = right direction
+                #   - yaw=0 means facing +x (forward)
+                #
+                # Transform:
+                #   world_x = -sim.z  (forward = -Z in GLB)
+                #   world_y = sim.x   (right = +X in GLB)
+                #   world_yaw = sim.yaw  (no rotation needed!)
+                #
+                # This way, at sim.yaw=0:
+                #   - Camera faces -Z (GLB)
+                #   - world_x increases when moving forward ✓
+                #   - world_yaw=0 means facing +world_x ✓
+
+                # Set local origin at start for stable map coordinates
+                if not hasattr(self, "_glb_origin"):
+                    self._glb_origin = (self.sim.x, self.sim.z)
+
+                sx = (self.sim.x - self._glb_origin[0]) / 100.0  # meters
+                sz = (self.sim.z - self._glb_origin[1]) / 100.0  # meters
+
+                world_x = -sz   # forward (GLB -Z becomes +world_x)
+                world_y = sx    # right (GLB +X becomes +world_y)
+                world_yaw = self.sim.yaw  # No transform needed!
             else:
                 # Fallback to spatial mapper for simple simulator
                 pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()
                 world_x, world_y, world_yaw = pose_x, pose_y, pose_yaw
 
-            # CRITICAL: Update occupancy grid from depth BEFORE making decision
-            # (The main spatial_mapper.update happens after action, but we need
-            # current observations to find frontiers correctly)
+            # Update occupancy grid from depth BEFORE making decision
             if depth_map is not None:
                 self.spatial_mapper.map.update_from_depth(
                     depth_map, world_x, world_y, world_yaw, max_range=3.0
                 )
 
             # Choose action using frontier-based policy
-            debug_this_frame = (self._frame_count % 10 == 0)  # More frequent debug
+            debug_this_frame = (self._frame_count % 10 == 0)
             action = self.frontier_explorer.choose_action(
                 grid=self.spatial_mapper.map.grid,
                 agent_x=world_x,

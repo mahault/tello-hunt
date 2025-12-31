@@ -566,11 +566,9 @@ class GLBSimulator:
         elif action == 2:  # Back - SHOULD NEVER REACH HERE
             print(f"  [MOVE] ERROR: Backward action reached movement code!")
             return False
-        elif action == 3:  # Turn left (CCW, yaw DECREASES in simulator convention)
-            # Note: In simulator coords, yaw=0 faces -Z, yaw+ rotates towards +X (CW from above)
-            # So "turn left" from drone's perspective = CCW = yaw DECREASES
+        elif action == 3:  # Turn left (CCW when viewed from above)
             self.yaw -= self.turn_speed
-        elif action == 4:  # Turn right (CW, yaw INCREASES in simulator convention)
+        elif action == 4:  # Turn right (CW when viewed from above)
             self.yaw += self.turn_speed
         # Strafe actions (5, 6) are blocked at the start of move() and will never reach here
         elif action == 7:  # Look up

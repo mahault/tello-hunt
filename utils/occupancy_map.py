@@ -156,13 +156,17 @@ class OccupancyMap:
             # Use minimum depth (closest obstacle)
             if len(col_depths) > 0:
                 # Depth is inverted: 1 = near, 0 = far
-                # Convert to distance
-                rel_depth = float(np.max(col_depths))  # Max = closest
+                # Robustify against single-pixel spikes/noise:
+                # Use a high percentile (still "near"-biased) instead of max().
+                rel_depth = float(np.percentile(col_depths, 90))
+                rel_depth = float(np.clip(rel_depth, 0.0, 1.0))
 
-                if rel_depth > 0.1:  # Ignore very far
+                if rel_depth > 0.1:  # Ignore very far / unknown
                     # Convert relative depth to distance
-                    # rel_depth=1 -> dist=0, rel_depth=0 -> dist=max_range
+                    # rel_depth=1 -> dist≈0, rel_depth=0 -> dist=max_range
                     distance = (1.0 - rel_depth) * max_range
+                    # Clamp: avoid marking obstacles unrealistically close due to noise
+                    distance = max(distance, 0.25)
 
                     # Calculate obstacle position
                     obs_x = pose_x + distance * np.cos(ray_angle)
@@ -172,7 +176,7 @@ class OccupancyMap:
 
                     # Ray trace: mark cells along ray as free
                     self._ray_trace(drone_cx, drone_cy, obs_cx, obs_cy,
-                                   mark_end_occupied=(rel_depth > 0.3))
+                                   mark_end_occupied=(rel_depth > 0.55))
 
     def _ray_trace(
         self,
