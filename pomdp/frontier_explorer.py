@@ -74,11 +74,12 @@ class FrontierExplorer:
         self._frame_count = 0
         self._no_valid_frontier_count = 0  # Track consecutive failures
         self._phase = "EARLY"  # EARLY or MID
-        self._consecutive_blocks = 0  # Track blocked movements
+        self._current_target_blocks = 0  # Blocks while pursuing CURRENT target
         self._blocked_targets: List[Tuple[Tuple[int, int], int]] = []  # (cell, expiry_frame)
-        self._blacklist_duration = 30  # Frames to blacklist (shorter = less aggressive)
-        self._blacklist_radius = 2  # Cells - only skip very close clusters
-        self._max_blacklisted = 5  # Max concurrent blacklisted targets
+        self._blacklist_duration = 50  # Frames to blacklist
+        self._blacklist_radius = 3  # Cells - skip nearby clusters
+        self._max_blacklisted = 8  # Max concurrent blacklisted targets
+        self._blocks_to_blacklist = 2  # Blocks before blacklisting current target
 
     def extract_frontiers(
         self,
@@ -223,6 +224,8 @@ class FrontierExplorer:
         clusters: List[FrontierCluster],
         grid: np.ndarray,
         agent_cell: Tuple[int, int],
+        agent_yaw: float = None,
+        agent_world: Tuple[float, float] = None,
         debug: bool = False,
     ) -> Optional[FrontierCluster]:
         """
@@ -230,7 +233,8 @@ class FrontierExplorer:
         1. Must be above minimum distance (SAFEGUARD 1)
         2. Must be reachable via free space (SAFEGUARD 3)
         3. Must not be blacklisted (recently blocked)
-        4. Among valid clusters, pick nearest
+        4. Must be IN FRONT of drone (no backward targets)
+        5. Among valid clusters, pick nearest
         """
         valid = []
 
@@ -249,6 +253,23 @@ class FrontierExplorer:
                     print(f"  [FRONTIER] Skipping blacklisted cluster at {cluster.centroid_world}")
                 continue
 
+            # SAFEGUARD 5: Must be in front of drone (within 90°)
+            if agent_yaw is not None and agent_world is not None:
+                target_heading = math.atan2(
+                    cluster.centroid_world[1] - agent_world[1],
+                    cluster.centroid_world[0] - agent_world[0]
+                )
+                heading_diff = target_heading - agent_yaw
+                while heading_diff > math.pi:
+                    heading_diff -= 2 * math.pi
+                while heading_diff < -math.pi:
+                    heading_diff += 2 * math.pi
+
+                if abs(heading_diff) > math.pi / 2:
+                    if debug:
+                        print(f"  [FRONTIER] Skipping backward cluster at {cluster.centroid_world}")
+                    continue
+
             valid.append(cluster)
 
         if not valid:
@@ -262,19 +283,54 @@ class FrontierExplorer:
         frontiers: List[Tuple[int, int]],
         agent_cell: Tuple[int, int],
         map_to_world_fn,
+        min_dist_cells: int = 0,  # Minimum distance in cells
+        agent_yaw: float = None,  # Agent's current heading (if provided, prefer forward frontiers)
+        agent_world: Tuple[float, float] = None,  # Agent's world position
     ) -> Optional[Tuple[Tuple[float, float], Tuple[int, int]]]:
-        """Select nearest frontier cell (no filtering - for bootstrap phase)."""
+        """
+        Select nearest frontier cell, preferring frontiers in front of the drone.
+
+        This prevents selecting targets behind the drone which would require
+        180° rotation and appear as "going backward".
+        """
         if not frontiers:
             return None
 
         ax, ay = agent_cell
         best_cell = None
-        best_dist = float('inf')
+        best_score = float('inf')
 
         for fx, fy in frontiers:
             dist = math.sqrt((fx - ax)**2 + (fy - ay)**2)
-            if dist < best_dist:
-                best_dist = dist
+            # Skip frontiers too close (prevents selecting agent's own cell)
+            if dist < min_dist_cells:
+                continue
+            # Skip blacklisted frontiers
+            if self._is_blacklisted((fx, fy)):
+                continue
+
+            # If we know the agent's heading, REJECT targets behind us
+            if agent_yaw is not None and agent_world is not None:
+                world_pos = map_to_world_fn(fx, fy)
+                target_heading = math.atan2(
+                    world_pos[1] - agent_world[1],
+                    world_pos[0] - agent_world[0]
+                )
+                heading_diff = target_heading - agent_yaw
+                # Normalize to [-π, π]
+                while heading_diff > math.pi:
+                    heading_diff -= 2 * math.pi
+                while heading_diff < -math.pi:
+                    heading_diff += 2 * math.pi
+
+                # REJECT targets that require more than 90° rotation
+                # This prevents "going backward" - drone only moves where camera can see
+                if abs(heading_diff) > math.pi / 2:
+                    continue  # Skip this frontier entirely
+
+            # Score is just distance (all remaining targets are in front)
+            if dist < best_score:
+                best_score = dist
                 best_cell = (fx, fy)
 
         if best_cell is None:
@@ -326,15 +382,33 @@ class FrontierExplorer:
                 self.target_cell = None
 
         # Check if current target is still valid
-        # Only invalidate if it becomes an OBSTACLE (not just unknown)
         if self.target_cell is not None:
+            # Invalidate if target became an obstacle
             tx, ty = self.target_cell
             if 0 <= tx < grid.shape[1] and 0 <= ty < grid.shape[0]:
                 cell_val = grid[ty, tx]
-                # Only invalidate if clearly occupied (obstacle), not if unknown
                 if cell_val < 50:  # Definitely an obstacle
                     if debug:
                         print(f"  [FRONTIER] Target invalidated (obstacle)")
+                    self.target = None
+                    self.target_cell = None
+
+            # Invalidate if target is now BEHIND the drone (more than 90°)
+            # This prevents backward movement after rotations
+            if self.target is not None:
+                target_heading = math.atan2(
+                    self.target[1] - agent_y,
+                    self.target[0] - agent_x
+                )
+                heading_diff = target_heading - agent_yaw
+                while heading_diff > math.pi:
+                    heading_diff -= 2 * math.pi
+                while heading_diff < -math.pi:
+                    heading_diff += 2 * math.pi
+
+                if abs(heading_diff) > math.pi / 2:
+                    if debug:
+                        print(f"  [FRONTIER] Target abandoned (now behind drone)")
                     self.target = None
                     self.target_cell = None
 
@@ -359,10 +433,16 @@ class FrontierExplorer:
 
             # === PHASE-DEPENDENT TARGET SELECTION ===
             if self._phase == "EARLY":
-                # BOOTSTRAP: No filters, just pick nearest frontier cell
-                result = self._select_nearest_frontier_cell(frontiers, agent_cell, map_to_world_fn)
+                # BOOTSTRAP: Pick nearest FORWARD frontier cell
+                result = self._select_nearest_frontier_cell(
+                    frontiers, agent_cell, map_to_world_fn,
+                    min_dist_cells=3,  # At least 3 cells away to avoid self-selection
+                    agent_yaw=agent_yaw,  # Prefer frontiers in front of drone
+                    agent_world=agent_world
+                )
                 if result:
                     self.target, self.target_cell = result
+                    self._current_target_blocks = 0  # Reset for new target
                     if debug:
                         print(f"  [FRONTIER] EARLY: nearest frontier at ({self.target[0]:.2f}, {self.target[1]:.2f})")
                 else:
@@ -378,25 +458,36 @@ class FrontierExplorer:
                 if debug:
                     print(f"  [FRONTIER] MID: {len(frontiers)} cells -> {len(self.clusters)} clusters")
 
-                # Select best cluster (applies min distance, reachability, blacklist)
-                best = self.select_best_frontier(self.clusters, grid, agent_cell, debug=debug)
+                # Select best cluster (applies min distance, reachability, blacklist, forward-only)
+                best = self.select_best_frontier(
+                    self.clusters, grid, agent_cell,
+                    agent_yaw=agent_yaw, agent_world=agent_world, debug=debug
+                )
 
                 if best is None:
-                    # FALLBACK: Pick nearest raw frontier (don't halt!)
-                    result = self._select_nearest_frontier_cell(frontiers, agent_cell, map_to_world_fn)
+                    # FALLBACK: Pick nearest FORWARD frontier
+                    result = self._select_nearest_frontier_cell(
+                        frontiers, agent_cell, map_to_world_fn,
+                        min_dist_cells=3,
+                        agent_yaw=agent_yaw,
+                        agent_world=agent_world
+                    )
                     if result:
                         self.target, self.target_cell = result
+                        self._current_target_blocks = 0  # Reset for new target
                         if debug:
                             print(f"  [FRONTIER] MID fallback: nearest frontier at ({self.target[0]:.2f}, {self.target[1]:.2f})")
                     else:
-                        # Ultimate fallback: move forward safely
+                        # No frontiers in front - ROTATE to find them
+                        # Don't move forward blindly as that could hit walls
                         if debug:
-                            print(f"  [FRONTIER] No valid target - moving forward")
-                        return FORWARD
+                            print(f"  [FRONTIER] No forward frontiers - rotating to scan")
+                        return ROTATE_LEFT if self._frame_count % 2 == 0 else ROTATE_RIGHT
                 else:
                     self._no_valid_frontier_count = 0
                     self.target = best.centroid_world
                     self.target_cell = best.centroid_cell
+                    self._current_target_blocks = 0  # Reset for new target
 
                     if debug:
                         print(f"  [FRONTIER] MID: cluster {best.size} cells at "
@@ -419,8 +510,30 @@ class FrontierExplorer:
             dist = math.sqrt((agent_x - self.target[0])**2 + (agent_y - self.target[1])**2)
             print(f"  [FRONTIER] Navigating: dist={dist:.2f}m, heading_error={math.degrees(heading_error):.1f}deg")
 
-        # If facing target, move forward
+        # If facing target, check if path looks clear before moving
         if abs(heading_error) < self.heading_tolerance:
+            # Check MULTIPLE points ahead for obstacles
+            check_distances = [0.2, 0.4, 0.6]  # meters
+            for check_dist in check_distances:
+                check_x = agent_x + check_dist * math.cos(agent_yaw)
+                check_y = agent_y + check_dist * math.sin(agent_yaw)
+                check_cell = world_to_map_fn(check_x, check_y)
+
+                if (0 <= check_cell[0] < grid.shape[1] and
+                    0 <= check_cell[1] < grid.shape[0]):
+                    cell_val = grid[check_cell[1], check_cell[0]]
+                    if cell_val < 50:  # Only block on definite obstacles (value < 50)
+                        # Direction is blocked - blacklist this target and rotate
+                        print(f"  [FRONTIER] Path blocked at {check_dist:.1f}m (cell={cell_val}), blacklisting")
+                        if self.target_cell is not None:
+                            expiry = self._frame_count + self._blacklist_duration
+                            self._blocked_targets.append((self.target_cell, expiry))
+                        self.target = None
+                        self.target_cell = None
+                        self._current_target_blocks = 0
+                        # Rotate to explore a different direction
+                        return ROTATE_LEFT if self._frame_count % 2 == 0 else ROTATE_RIGHT
+
             return FORWARD
 
         # Otherwise rotate toward target
@@ -434,21 +547,24 @@ class FrontierExplorer:
 
     def record_block(self, was_blocked: bool):
         """
-        Record that the last movement was blocked.
-        If blocked, blacklist target and force reselection.
+        Record that a movement was blocked while pursuing current target.
+
+        Key insight: If we're blocked while near the target, blacklist immediately.
+        This prevents getting stuck on targets that are technically "reachable"
+        but blocked by walls.
         """
-        if was_blocked:
-            self._consecutive_blocks += 1
-            # After 3+ consecutive blocks, blacklist this target and pick a new one
-            if self._consecutive_blocks >= 3 and self.target_cell is not None:
-                # Blacklist this target
-                expiry = self._frame_count + self._blacklist_duration
-                self._blocked_targets.append((self.target_cell, expiry))
-                self.target = None
-                self.target_cell = None
-                self._consecutive_blocks = 0
-        else:
-            self._consecutive_blocks = 0
+        if was_blocked and self.target_cell is not None:
+            self._current_target_blocks += 1
+            print(f"  [FRONTIER] Block #{self._current_target_blocks} for target {self.target}")
+
+            # Blacklist immediately (was 2 blocks, now 1)
+            # This prevents getting stuck on unreachable targets
+            print(f"  [FRONTIER] Blacklisting target {self.target} after block")
+            expiry = self._frame_count + self._blacklist_duration
+            self._blocked_targets.append((self.target_cell, expiry))
+            self.target = None
+            self.target_cell = None
+            self._current_target_blocks = 0  # Reset for next target
 
     def _is_blacklisted(self, cell: Tuple[int, int]) -> bool:
         """Check if a cell is currently blacklisted."""
@@ -476,7 +592,7 @@ class FrontierExplorer:
         self._frame_count = 0
         self._no_valid_frontier_count = 0
         self._phase = "EARLY"
-        self._consecutive_blocks = 0
+        self._current_target_blocks = 0
         self._blocked_targets = []
 
 

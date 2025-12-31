@@ -54,9 +54,9 @@ class GLBSimulator:
         self.yaw = 0.0    # Horizontal rotation (radians)
         self.pitch = 0.0  # Vertical rotation (radians)
 
-        # Movement settings
-        self.move_speed = 30.0  # Units per step (model is ~1000 units)
-        self.turn_speed = math.radians(15)
+        # Movement settings - smaller steps = less likely to pass through walls
+        self.move_speed = 15.0  # Units per step (reduced from 30 for safety)
+        self.turn_speed = math.radians(10)  # Smaller turns for more precise navigation
 
         # Room definitions - will be set after loading model
         self.rooms = {}
@@ -78,6 +78,28 @@ class GLBSimulator:
 
         # Load GLB
         self.trimesh_scene = trimesh.load(str(self.glb_path))
+
+        # Create a combined mesh for ray casting
+        # This is needed because Scene objects don't have a direct ray tracer
+        print("Setting up ray tracer for collision detection...")
+        try:
+            # Collect all meshes and combine them
+            meshes = []
+            if hasattr(self.trimesh_scene, 'geometry'):
+                for name, geom in self.trimesh_scene.geometry.items():
+                    if isinstance(geom, trimesh.Trimesh):
+                        meshes.append(geom)
+
+            if meshes:
+                # Concatenate all meshes into one for ray casting
+                self.collision_mesh = trimesh.util.concatenate(meshes)
+                print(f"  Combined {len(meshes)} meshes for collision detection")
+            else:
+                self.collision_mesh = None
+                print("  WARNING: No meshes found for collision detection!")
+        except Exception as e:
+            print(f"  WARNING: Failed to create collision mesh: {e}")
+            self.collision_mesh = None
 
         # Get bounds for positioning
         bounds = self.trimesh_scene.bounds
@@ -200,8 +222,8 @@ class GLBSimulator:
         x_min, y_min, z_min = bounds[0]
         x_max, y_max, z_max = bounds[1]
 
-        # Add margin to keep drone inside
-        margin = 50
+        # Add margin to keep drone inside (reduced from 50 to allow more exploration)
+        margin = 20
         x_min += margin
         x_max -= margin
         z_min += margin
@@ -236,16 +258,17 @@ class GLBSimulator:
             print(f"  {name}: x=[{xlo:.0f}, {xhi:.0f}], z=[{zlo:.0f}, {zhi:.0f}]")
         print(f"Vertical bounds: Y=[{y_floor:.0f}, {y_ceiling:.0f}] (floor to ceiling)")
 
-    def _check_ray_collision(self, action: int, min_distance: float = 50.0) -> bool:
+    def _check_ray_collision(self, action: int, min_distance: float = 80.0) -> bool:
         """
-        Check for obstacles using ray casting (accurate collision detection).
+        Check for obstacles using MULTI-RAY fan (robust collision detection).
 
-        Casts MULTIPLE rays in a cone from the drone's position to detect
-        walls and obstacles. Uses both forward and side-check rays for robustness.
+        Casts multiple rays in a wide fan to catch walls from any angle.
+        Uses conservative distance threshold (2.5x move_speed).
 
         Args:
             action: Movement action (1=forward, 2=back, 5=strafe left, 6=strafe right)
             min_distance: Minimum distance (in scene units) to consider blocked
+                         Default 80 = ~2.5x move_speed for safety margin
 
         Returns:
             True if path is blocked, False if clear
@@ -254,163 +277,176 @@ class GLBSimulator:
 
         # Get movement direction based on action
         if action == 1:  # Forward
-            dx = math.sin(self.yaw)
-            dz = -math.cos(self.yaw)
-        elif action == 2:  # Backward
-            dx = -math.sin(self.yaw)
-            dz = math.cos(self.yaw)
+            base_dx = math.sin(self.yaw)
+            base_dz = -math.cos(self.yaw)
+        elif action == 2:  # Backward - SHOULD NOT BE USED
+            print(f"  [RAY] WARNING: Backward action detected at ({self.x:.0f}, {self.z:.0f})!")
+            base_dx = -math.sin(self.yaw)
+            base_dz = math.cos(self.yaw)
         elif action == 5:  # Strafe left
-            dx = -math.cos(self.yaw)
-            dz = -math.sin(self.yaw)
+            base_dx = -math.cos(self.yaw)
+            base_dz = -math.sin(self.yaw)
         elif action == 6:  # Strafe right
-            dx = math.cos(self.yaw)
-            dz = math.sin(self.yaw)
+            base_dx = math.cos(self.yaw)
+            base_dz = math.sin(self.yaw)
         else:
             return False  # Non-translation action
 
-        # Cast multiple rays for robustness:
-        # 1. Center ray
-        # 2. Left/right offset rays (catch side collisions)
-        # 3. Up/down offset rays (catch floor/ceiling)
-        ray_offsets = [
-            (0, 0, 0),           # Center
-            (-15, 0, 0),         # Left offset
-            (15, 0, 0),          # Right offset
-            (0, 10, 0),          # Up offset
-            (0, -10, 0),         # Down offset
-        ]
-
-        # Also cast rays from the TARGET position back to check
-        # if we'd end up inside geometry
-        target_x = self.x + dx * self.move_speed
-        target_z = self.z + dz * self.move_speed
-
-        all_origins = []
-        all_directions = []
-
-        for ox, oy, oz in ray_offsets:
-            # Rotate offset to match drone orientation
-            rotated_ox = ox * math.cos(self.yaw) - oz * math.sin(self.yaw)
-            rotated_oz = ox * math.sin(self.yaw) + oz * math.cos(self.yaw)
-
-            origin = [self.x + rotated_ox, self.y + oy, self.z + rotated_oz]
-            direction = [dx, 0, dz]
-            all_origins.append(origin)
-            all_directions.append(direction)
-
-        # Add reverse ray from target to check if target is inside geometry
-        all_origins.append([target_x, self.y, target_z])
-        all_directions.append([-dx, 0, -dz])
-
-        origins = np.array(all_origins)
-        directions = np.array(all_directions)
-
-        # Cast rays against the scene
         try:
-            if hasattr(self.trimesh_scene, 'ray'):
-                locations, index_ray, index_tri = self.trimesh_scene.ray.intersects_location(
-                    ray_origins=origins,
-                    ray_directions=directions
-                )
+            # Use collision_mesh for ray casting (combined mesh with ray tracer)
+            if self.collision_mesh is None:
+                return False  # Can't check, allow movement
 
-                if len(locations) == 0:
-                    return False  # No hit, path is clear
+            # WIDE MULTI-RAY FAN: Cast 9 rays in a 60-degree fan
+            fan_angles = [-0.52, -0.39, -0.26, -0.13, 0, 0.13, 0.26, 0.39, 0.52]
+            origins = []
+            directions = []
 
-                # Check each ray's closest hit
-                for ray_idx in range(len(origins)):
-                    ray_mask = index_ray == ray_idx
-                    if not np.any(ray_mask):
-                        continue
+            for angle_offset in fan_angles:
+                # Rotate direction by angle_offset in XZ plane
+                cos_a = math.cos(angle_offset)
+                sin_a = math.sin(angle_offset)
+                dx = base_dx * cos_a - base_dz * sin_a
+                dz = base_dx * sin_a + base_dz * cos_a
 
-                    ray_locations = locations[ray_mask]
-                    ray_origin = origins[ray_idx]
-                    distances = np.linalg.norm(ray_locations - ray_origin, axis=1)
-                    closest = np.min(distances)
+                origins.append([self.x, self.y, self.z])
+                directions.append([dx, 0, dz])
 
-                    # For reverse ray (last one), a close hit means target is near/in geometry
-                    if ray_idx == len(origins) - 1:
-                        if closest < self.move_speed + 20:  # Hit behind us = bad target
-                            return True
-                    else:
-                        if closest < min_distance:
-                            return True
+            origins = np.array(origins)
+            directions = np.array(directions)
 
+            # Cast all rays at once using the collision mesh
+            locations, index_ray, index_tri = self.collision_mesh.ray.intersects_location(
+                ray_origins=origins,
+                ray_directions=directions
+            )
+
+            if len(locations) == 0:
+                # No hits - path is clear
                 return False
 
-            else:
-                # Fallback: iterate through meshes with center ray only
-                origin = np.array([[self.x, self.y, self.z]])
-                direction = np.array([[dx, 0, dz]])
-                closest_hit = float('inf')
+            # Find closest hit across ALL rays
+            closest_dist = float('inf')
+            for i, loc in enumerate(locations):
+                ray_idx = index_ray[i]
+                dist = np.linalg.norm(loc - origins[ray_idx])
+                if dist < closest_dist:
+                    closest_dist = dist
 
-                for name, geom in self.trimesh_scene.geometry.items():
-                    if isinstance(geom, trimesh.Trimesh):
-                        try:
-                            locations, index_ray, index_tri = geom.ray.intersects_location(
-                                ray_origins=origin,
-                                ray_directions=direction
-                            )
-                            if len(locations) > 0:
-                                distances = np.linalg.norm(locations - origin, axis=1)
-                                closest_hit = min(closest_hit, np.min(distances))
-                        except:
-                            pass
+            # Block if closest hit is too near
+            if closest_dist < min_distance:
+                return True
 
-                return closest_hit < min_distance
-
-        except Exception as e:
-            # Fallback to bounds check if ray casting fails
             return False
 
-    def _check_depth_obstacle(self, action: int, min_distance: float = 80.0) -> bool:
-        """
-        Check for obstacles using the depth buffer (backup method).
+        except Exception as e:
+            print(f"  [RAY] Error in collision check: {e}")
+            return False  # If error, allow movement (was blocking everything)
 
-        This method renders the current view and checks if there's an obstacle
-        too close in the direction of movement. Works like a real depth sensor.
+    def _is_inside_geometry(self, min_clear_radius: float = 15.0) -> bool:
+        """
+        Check if the drone is inside geometry by casting rays in all directions.
+
+        If ANY horizontal direction has a very close hit, we might be in a wall.
+        Uses lower threshold (15 units = half move_speed) for safety.
 
         Args:
-            action: Movement action (1=forward, 2=back, 5=strafe left, 6=strafe right)
+            min_clear_radius: Minimum distance that should be clear
+
+        Returns:
+            True if drone appears to be inside geometry
+        """
+        try:
+            if self.collision_mesh is None:
+                return False
+
+            # Cast rays in 8 horizontal directions (more coverage)
+            directions = []
+            for angle in range(0, 360, 45):
+                rad = math.radians(angle)
+                directions.append([math.cos(rad), 0, math.sin(rad)])
+
+            origin = np.array([self.x, self.y, self.z])
+            origins = np.tile(origin, (len(directions), 1))
+            directions = np.array(directions, dtype=np.float64)
+
+            locations, index_ray, _ = self.collision_mesh.ray.intersects_location(
+                ray_origins=origins,
+                ray_directions=directions
+            )
+
+            if len(locations) == 0:
+                # No hits at all - might be outside the model
+                return False
+
+            # Check if ANY direction has a very close hit
+            for i, loc in enumerate(locations):
+                ray_idx = index_ray[i]
+                dist = np.linalg.norm(loc - origins[ray_idx])
+                if dist < min_clear_radius:
+                    return True
+
+            return False
+
+        except Exception as e:
+            print(f"  [CONTAIN] Error: {e}")
+            return False  # Allow movement if check fails
+
+    def _check_depth_obstacle(self, action: int, min_distance: float = 18.0) -> bool:
+        """
+        Check for obstacles using DEPTH BUFFER (reliable, no rtree needed).
+
+        Renders the current view and checks if there's an obstacle too close.
+        Uses 10th percentile of depth to be robust against noise/outliers.
+
+        Args:
+            action: Movement action (1=forward, 5=strafe left, 6=strafe right)
             min_distance: Minimum distance (in scene units) to consider blocked
+                         Default 25 = ~1.6x move_speed (15) for safety margin
 
         Returns:
             True if path is blocked, False if clear
         """
-        # Use ray casting for accurate collision detection
-        if self._check_ray_collision(action, min_distance):
-            return True
-
-        # Fallback: depth buffer check for forward movement only
+        # Only check for forward movement - strafe movements are protected by bounds check
         if action != 1:
             return False
 
         # Render current view to get depth buffer
         self._update_camera()
-        color, depth = self.renderer.render(self.scene)
+        try:
+            color, depth = self.renderer.render(self.scene)
+        except Exception as e:
+            print(f"  [DEPTH] Render error: {e}")
+            return False  # Allow movement on error
 
         h, w = depth.shape
         center_y = h // 2
-        center_x = w // 2
 
-        # Check center region for forward movement
-        y1, y2 = max(0, center_y - 40), min(h, center_y + 40)
-        x1, x2 = max(0, center_x - 80), min(w, center_x + 80)
+        # Check WIDE horizontal strip (full width, but vertical center)
+        # This catches walls at the edges of view, not just center
+        y1, y2 = max(0, center_y - 30), min(h, center_y + 30)
+        x1, x2 = 0, w  # Full width to catch walls at edges
 
         sample_region = depth[y1:y2, x1:x2]
 
         if sample_region.size == 0:
             return False
 
-        # Find closest object (minimum non-zero depth)
+        # Find closest object using 5th percentile (catch walls at edges)
         valid_mask = (sample_region > 0) & (sample_region < 10000)
         valid_depths = sample_region[valid_mask]
 
-        if len(valid_depths) == 0:
+        if len(valid_depths) < 50:  # Need some samples
             return False
 
-        closest_distance = np.min(valid_depths)
+        # Use 5th percentile - catches walls even at edges of view
+        closest_distance = np.percentile(valid_depths, 5)
 
-        return closest_distance < min_distance
+        # Block if too close
+        if closest_distance < min_distance:
+            return True
+
+        return False
 
     def get_depth_buffer(self) -> np.ndarray:
         """
@@ -490,10 +526,30 @@ class GLBSimulator:
 
         # Save old position for collision check
         old_x, old_z = self.x, self.z
+        old_room = self._get_current_room()
+
+        # STRICT CHECK: Only allow movements where the camera is pointing
+        # Block backward (2) and strafe (5, 6) - camera can't see these directions
+        if action == 2:
+            print(f"  [MOVE] BLOCKED: Backward action rejected")
+            return False
+        if action in (5, 6):
+            print(f"  [MOVE] BLOCKED: Strafe action rejected (camera can't see sideways)")
+            return False
+
+        # PRE-CHECK: Calculate new position and verify it's valid BEFORE moving
+        if action == 1:  # Forward only (strafe and backward are blocked above)
+            new_x = self.x + self.move_speed * math.sin(self.yaw)
+            new_z = self.z - self.move_speed * math.cos(self.yaw)
+
+            # Check if new position would be outside bounds
+            if not self._is_inside_bounds(new_x, new_z):
+                print(f"  [MOVE] PRE-BLOCKED: Would go outside bounds ({new_x:.0f}, {new_z:.0f})")
+                return False
 
         # Check depth-based obstacle detection BEFORE moving (like real drone)
         obstacle_ahead = False
-        if action in (1, 2, 5, 6):  # All translation actions
+        if action == 1:  # Forward only
             obstacle_ahead = self._check_depth_obstacle(action)
 
         moved = True
@@ -503,39 +559,20 @@ class GLBSimulator:
         elif action == 1:  # Forward
             if obstacle_ahead:
                 moved = False
-                if debug:
-                    print(f"  [GLB] BLOCKED by wall (depth sensor)!")
+                print(f"  [MOVE] BLOCKED forward at ({self.x:.0f}, {self.z:.0f}) yaw={math.degrees(self.yaw):.0f}")
             else:
                 self.x += self.move_speed * math.sin(self.yaw)
                 self.z -= self.move_speed * math.cos(self.yaw)
-        elif action == 2:  # Back
-            if obstacle_ahead:
-                moved = False
-                if debug:
-                    print(f"  [GLB] BLOCKED by wall (depth sensor)!")
-            else:
-                self.x -= self.move_speed * math.sin(self.yaw)
-                self.z += self.move_speed * math.cos(self.yaw)
-        elif action == 3:  # Turn left
-            self.yaw += self.turn_speed
-        elif action == 4:  # Turn right
+        elif action == 2:  # Back - SHOULD NEVER REACH HERE
+            print(f"  [MOVE] ERROR: Backward action reached movement code!")
+            return False
+        elif action == 3:  # Turn left (CCW, yaw DECREASES in simulator convention)
+            # Note: In simulator coords, yaw=0 faces -Z, yaw+ rotates towards +X (CW from above)
+            # So "turn left" from drone's perspective = CCW = yaw DECREASES
             self.yaw -= self.turn_speed
-        elif action == 5:  # Strafe left
-            if obstacle_ahead:
-                moved = False
-                if debug:
-                    print(f"  [GLB] BLOCKED by wall on left (depth sensor)!")
-            else:
-                self.x -= self.move_speed * math.cos(self.yaw)
-                self.z -= self.move_speed * math.sin(self.yaw)
-        elif action == 6:  # Strafe right
-            if obstacle_ahead:
-                moved = False
-                if debug:
-                    print(f"  [GLB] BLOCKED by wall on right (depth sensor)!")
-            else:
-                self.x += self.move_speed * math.cos(self.yaw)
-                self.z += self.move_speed * math.sin(self.yaw)
+        elif action == 4:  # Turn right (CW, yaw INCREASES in simulator convention)
+            self.yaw += self.turn_speed
+        # Strafe actions (5, 6) are blocked at the start of move() and will never reach here
         elif action == 7:  # Look up
             self.pitch = min(self.pitch + self.turn_speed, math.radians(60))
         elif action == 8:  # Look down
@@ -545,13 +582,17 @@ class GLBSimulator:
         self.yaw = self.yaw % (2 * math.pi)
 
         # Check bounds - keep drone inside the model
-        if action in (1, 2, 5, 6) and moved:  # Movement actions
+        if action == 1 and moved:  # Forward movement only
+            new_room = self._get_current_room()
+
+            # Check navigable bounds (should not happen due to pre-check, but double-check)
             if not self._is_inside_bounds(self.x, self.z):
-                # Revert movement
+                print(f"  [MOVE] REVERTED: Outside bounds ({self.x:.0f}, {self.z:.0f})")
                 self.x, self.z = old_x, old_z
                 moved = False
-                if debug:
-                    print(f"  [GLB] BLOCKED at boundary!")
+            # Log room transitions for debugging
+            elif old_room != "Unknown" and new_room != old_room:
+                print(f"  [MOVE] Room: {old_room} -> {new_room}")
 
         if debug and moved:
             room = self._get_current_room()

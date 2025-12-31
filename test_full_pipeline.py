@@ -105,6 +105,94 @@ from pomdp.frontier_explorer import FrontierExplorer
 # For fake YOLO detections
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
+import math
+
+
+def execute_action_heading_first(action: int, sim, frame=None, depth_map=None, collision_avoidance=None,
+                                  yaw_tol_deg: float = 15.0, debug: bool = False) -> Tuple[bool, bool]:
+    """
+    Heading-first movement gate: ensures drone faces direction before moving.
+
+    For any translational action (forward/back/strafe), this converts it to:
+    1. Rotate to face that direction (if not already aligned)
+    2. Check clearance
+    3. Move forward
+
+    This ensures the drone ONLY moves in the direction the camera is pointing.
+
+    Args:
+        action: The desired action (0=stay, 1=fwd, 2=back, 3=left, 4=right, 5=strafe_l, 6=strafe_r)
+        sim: The simulator instance
+        depth_map: Optional depth map for collision checking
+        collision_avoidance: Optional collision avoidance system
+        yaw_tol_deg: Yaw tolerance in degrees before we consider aligned
+        debug: Print debug info
+
+    Returns:
+        (moved: bool, blocked: bool) - whether movement occurred and whether it was blocked
+    """
+    # Action 0 is stay - pass through
+    if action == 0:
+        return True, False
+
+    # Actions 3, 4 are pure rotation - pass through directly
+    if action in (3, 4):
+        moved = sim.move(action, debug=debug)
+        return moved, False
+
+    # Get current yaw (in radians)
+    current_yaw = sim.yaw if hasattr(sim, 'yaw') else 0.0
+
+    # Map translational actions to desired yaw offset from current heading
+    # These represent WHERE we want to go relative to current facing
+    yaw_offset = 0.0
+    if action == 1:  # Forward - same direction we're facing
+        yaw_offset = 0.0
+    elif action == 2:  # Backward - want to go behind us
+        yaw_offset = math.pi  # 180° turn
+    elif action == 5:  # Strafe left - want to go to our left
+        yaw_offset = -math.pi / 2  # 90° left
+    elif action == 6:  # Strafe right - want to go to our right
+        yaw_offset = math.pi / 2  # 90° right
+    else:
+        # Unknown action - try it directly
+        moved = sim.move(action, debug=debug)
+        return moved, not moved
+
+    # For forward action (yaw_offset=0), no rotation needed - just move
+    # For other actions, we need to rotate first
+    yaw_tol_rad = math.radians(yaw_tol_deg)
+
+    if abs(yaw_offset) > yaw_tol_rad:
+        # Need to rotate to face the desired direction
+        # Determine which way to turn
+        if yaw_offset > 0:
+            turn_action = 4  # Turn right
+        else:
+            turn_action = 3  # Turn left
+
+        if debug:
+            print(f"  [HEADING-FIRST] Action {action} requires rotation: yaw_offset={math.degrees(yaw_offset):.1f}°, "
+                  f"turning {'right' if turn_action == 4 else 'left'}")
+
+        # Just rotate this frame - we'll move forward next frame when aligned
+        moved = sim.move(turn_action, debug=debug)
+        return moved, False  # Rotation is not a "block"
+
+    # We're aligned (or action was forward) - check clearance then move forward
+    # Check collision avoidance if available (needs both frame and depth)
+    if collision_avoidance is not None and depth_map is not None and frame is not None:
+        collision_state = collision_avoidance.assess_risk(frame, depth_map, debug=False)
+        if collision_state.combined_risk > 0.7:  # High collision risk
+            if debug:
+                print(f"  [HEADING-FIRST] Forward blocked by collision risk: {collision_state.combined_risk:.2f}")
+            return False, True  # Blocked
+
+    # Move forward (the only translation we ever do)
+    if debug:
+        print(f"  [HEADING-FIRST] Aligned, moving forward")
+    moved = sim.move(1, debug=debug)  # Always action 1 (forward)
+    return moved, not moved
 
 
 @dataclass
@@ -470,10 +558,30 @@ class FullPipelineSimulator:
         # Render frame
         frame = self.sim.render()
 
-        # Depth estimation (realistic - same method would work on real drone)
+        # Depth estimation
+        # For GLB simulator: use accurate depth buffer from renderer
+        # For real drone: use Depth Anything estimation
         depth_map = None
         depth_distances = None
-        if self.depth_estimator is not None:
+        if self.use_glb and hasattr(self.sim, 'get_depth_buffer'):
+            # Use simulator's accurate depth buffer
+            raw_depth = self.sim.get_depth_buffer()
+            # Convert to relative depth (0=far, 1=near) to match Depth Anything format
+            # Raw depth is in scene units - use dynamic normalization
+            valid_depths = raw_depth[(raw_depth > 0) & (raw_depth < 10000)]
+            if len(valid_depths) > 0:
+                max_depth = np.percentile(valid_depths, 95)
+                max_depth = max(max_depth, 100.0)  # Minimum 100 units
+            else:
+                max_depth = 300.0
+            depth_map = 1.0 - np.clip(raw_depth / max_depth, 0, 1)
+            depth_map = depth_map.astype(np.float32)
+
+            # Debug: print depth stats occasionally
+            if self._frame_count % 100 == 0:
+                print(f"  [DEPTH] raw range: {raw_depth.min():.0f}-{raw_depth.max():.0f}, "
+                      f"max_depth={max_depth:.0f}, near={depth_map.max():.2f}")
+        elif self.depth_estimator is not None:
             depth_map = self.depth_estimator.estimate(frame)
             depth_distances = self.depth_estimator.get_obstacle_distances(depth_map)
 
@@ -603,28 +711,46 @@ class FullPipelineSimulator:
                 if debug_this_frame:
                     print(f"  [DEPTH] Obstacle detected! Distance={path_distance:.2f}")
 
-        # Execute action
+        # Execute action using heading-first gate
+        # This ensures the drone ONLY moves in the direction the camera is pointing
         moved = True
+        action_blocked = False
+        original_action = action  # Track what was requested
+
         if action > 0:
             # If collision predicted, report to CSCG preemptively
             if collision_blocked:
                 self.cscg.record_blocked_action(action)
                 if self.mode == "exploration":
                     self.exploration.record_movement_result(action, False)
+                moved = False
+                action_blocked = True
+            else:
+                # Use heading-first gate for all actions
+                # This converts back/strafe to rotation + forward automatically
+                moved, action_blocked = execute_action_heading_first(
+                    action=action,
+                    sim=self.sim,
+                    frame=frame,
+                    depth_map=depth_map,
+                    collision_avoidance=self.collision_avoidance,
+                    yaw_tol_deg=15.0,
+                    debug=debug_this_frame
+                )
 
-            moved = self.sim.move(action, debug=debug_this_frame)
-            # Report movement result to exploration (for wall detection)
-            if self.mode == "exploration" and not collision_blocked:
-                self.exploration.record_movement_result(action, moved)
-            # Report blocked actions to CSCG so it learns obstacles
-            if not moved and not collision_blocked:
-                self.cscg.record_blocked_action(action)
-                if debug_this_frame:
-                    print(f"  [PIPELINE] Action {action} blocked at place {self.cscg._prev_token}")
-                # Mark obstacle in occupancy grid when simulator blocks
-                if action == 1 and self.use_frontier:  # Forward blocked
-                    pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()
-                    self.spatial_mapper.map.mark_obstacle_ahead(pose_x, pose_y, pose_yaw)
+                # Report movement result to exploration (for wall detection)
+                if self.mode == "exploration":
+                    self.exploration.record_movement_result(action, moved and not action_blocked)
+
+                # Report blocked actions to CSCG so it learns obstacles
+                if action_blocked:
+                    self.cscg.record_blocked_action(action)
+                    if debug_this_frame:
+                        print(f"  [PIPELINE] Action {action} blocked at place {self.cscg._prev_token}")
+                    # Mark obstacle in occupancy grid when simulator blocks
+                    if original_action in (1, 2, 5, 6) and self.use_frontier:  # Any translational blocked
+                        pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()
+                        self.spatial_mapper.map.mark_obstacle_ahead(pose_x, pose_y, pose_yaw)
 
         self._last_action = action
         self._frame_count += 1
@@ -633,23 +759,21 @@ class FullPipelineSimulator:
         if self.use_topological:
             self._topo_prev_place = current_place_id
             self._topo_prev_action = action
-            self._topo_prev_moved = moved and not collision_blocked
+            self._topo_prev_moved = moved and not action_blocked
             # Inform explorer about blocked movements (for scan/escape mode)
-            was_blocked = not moved or collision_blocked
-            if action in [1, 2, 5, 6]:  # All movement actions (forward, back, strafe)
-                self.topo_explorer.record_block(was_blocked)
+            # Only count as blocked if we tried to move forward (after heading-first processing)
+            if original_action in [1, 2, 5, 6]:  # All translational actions
+                self.topo_explorer.record_block(action_blocked)
 
         # Inform look-ahead explorer about blocked movements
         if self.use_lookahead:
-            was_blocked = not moved or collision_blocked
-            if action in [1, 2, 5, 6]:  # All movement actions
-                self.lookahead_explorer.record_block(was_blocked)
+            if original_action in [1, 2, 5, 6]:  # All translational actions
+                self.lookahead_explorer.record_block(action_blocked)
 
         # Inform frontier explorer about blocked movements
         if self.use_frontier:
-            was_blocked = not moved or collision_blocked
-            if action in [1, 2, 5, 6]:  # All movement actions
-                self.frontier_explorer.record_block(was_blocked)
+            if original_action in [1, 2, 5, 6]:  # All translational actions
+                self.frontier_explorer.record_block(action_blocked)
 
         # Track room visits for analysis
         current_room = self.sim._get_current_room() if hasattr(self.sim, '_get_current_room') else "Unknown"
@@ -704,24 +828,47 @@ class FullPipelineSimulator:
 
         # === FRONTIER-BASED EXPLORATION ===
         if self.use_frontier:
-            # Get current pose from spatial mapper
-            pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()
+            # CRITICAL FIX: Use simulator's ACTUAL pose, not odometry!
+            # The odometry uses a different yaw convention which causes backward movement.
+            #
+            # Simulator convention:
+            #   Forward = (sin(yaw), -cos(yaw)) in (x, z)
+            #   yaw=0 → facing -Z direction
+            #
+            # Frontier explorer (atan2) convention:
+            #   Forward = (cos(yaw), sin(yaw)) in (x, y)
+            #   yaw=0 → facing +X direction
+            #
+            # Mapping: sim.x → world.x, sim.z → world.y (note: NOT negated)
+            #          sim.yaw → world.yaw - π/2 (rotate 90° CCW)
+            if self.use_glb:
+                # Use simulator's ground truth pose with coordinate transform
+                world_x = self.sim.x / 100.0  # Convert to meters (rough scale)
+                world_y = self.sim.z / 100.0  # Map z to y
+                # Transform yaw: simulator yaw=0 means facing -Z
+                # In the occupancy grid, we want yaw=0 to mean facing +X
+                # So we need: world_yaw = sim_yaw - π/2
+                world_yaw = self.sim.yaw - math.pi / 2
+            else:
+                # Fallback to spatial mapper for simple simulator
+                pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()
+                world_x, world_y, world_yaw = pose_x, pose_y, pose_yaw
 
             # CRITICAL: Update occupancy grid from depth BEFORE making decision
             # (The main spatial_mapper.update happens after action, but we need
             # current observations to find frontiers correctly)
             if depth_map is not None:
                 self.spatial_mapper.map.update_from_depth(
-                    depth_map, pose_x, pose_y, pose_yaw, max_range=3.0
+                    depth_map, world_x, world_y, world_yaw, max_range=3.0
                 )
 
             # Choose action using frontier-based policy
             debug_this_frame = (self._frame_count % 10 == 0)  # More frequent debug
             action = self.frontier_explorer.choose_action(
                 grid=self.spatial_mapper.map.grid,
-                agent_x=pose_x,
-                agent_y=pose_y,
-                agent_yaw=pose_yaw,
+                agent_x=world_x,
+                agent_y=world_y,
+                agent_yaw=world_yaw,
                 world_to_map_fn=self.spatial_mapper.map.world_to_map,
                 map_to_world_fn=self.spatial_mapper.map.map_to_world,
                 debug=debug_this_frame,

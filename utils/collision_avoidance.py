@@ -382,36 +382,30 @@ class CollisionAvoidance:
         # Action mapping: 0=stay, 1=forward, 2=back, 3=left, 4=right
 
         if state.risk_level == RiskLevel.CRITICAL:
-            # Emergency: rotate 180° to face backward, then check if clear
-            # This avoids blindly backing into walls
+            # Emergency: STOP and rotate to find a clear direction
+            # NEVER move backward or move forward blindly - just rotate in place
+            # The exploration logic will handle finding a new path
 
-            if self._backoff_rotation_frames < self._backoff_rotation_target:
-                # Still rotating - continue turning
-                self._backoff_rotation_frames += 1
-                if debug:
-                    print(f"  [COLLISION] CRITICAL - rotating to face backoff direction "
-                          f"({self._backoff_rotation_frames}/{self._backoff_rotation_target})")
-                return self._backoff_turn_direction, "backoff_rotation"
+            # Rotate slowly to scan for a clear direction
+            self._backoff_rotation_frames += 1
+
+            # Alternate rotation direction every 9 frames (~90°)
+            if self._backoff_rotation_frames % 18 < 9:
+                turn_dir = 3  # Turn left
             else:
-                # Finished rotating - now facing backward direction
-                # Forward (action 1) is now the backoff direction
-                # Check if it's clear via the state (which assesses forward risk)
-                if state.combined_risk < self.thresholds['high']:
-                    # Path is now clear, move forward (which is backing off)
-                    if debug:
-                        print(f"  [COLLISION] CRITICAL - backoff direction clear, moving")
-                    # Reset rotation state for next time
-                    self._backoff_rotation_frames = 0
-                    return 1, "backoff_move_forward"
-                else:
-                    # Still blocked after rotation - try staying or turning more
-                    if debug:
-                        print(f"  [COLLISION] CRITICAL - backoff direction blocked, staying")
-                    # Reset and try a different direction next time
-                    self._backoff_rotation_frames = 0
-                    # Alternate turn direction for next attempt
-                    self._backoff_turn_direction = 3 if self._backoff_turn_direction == 4 else 4
-                    return 0, "backoff_blocked_stay"
+                turn_dir = 4  # Turn right
+
+            # If we've been stuck rotating for too long (full 360°), just stay
+            if self._backoff_rotation_frames > 36:
+                self._backoff_rotation_frames = 0
+                if debug:
+                    print(f"  [COLLISION] CRITICAL - completed full scan, staying")
+                return 0, "critical_stay"
+
+            if debug:
+                print(f"  [COLLISION] CRITICAL - scanning for clear path "
+                      f"(frame {self._backoff_rotation_frames})")
+            return turn_dir, "critical_scan"
 
         elif state.risk_level == RiskLevel.HIGH:
             # High risk: stop forward motion, initiate yaw scan

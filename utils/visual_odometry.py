@@ -299,9 +299,9 @@ class ActionBasedOdometry:
         Returns:
             Updated pose
         """
-        if action == 3:  # turn left
+        if action == 3:  # turn left (CCW in odometry coords where yaw=0 is +X)
             self.pose.yaw += self.turn_angle
-        elif action == 4:  # turn right
+        elif action == 4:  # turn right (CW)
             self.pose.yaw -= self.turn_angle
         elif moved:  # Only update position if movement succeeded
             if action == 1:  # forward
