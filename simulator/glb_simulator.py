@@ -521,7 +521,7 @@ class GLBSimulator:
         Returns:
             True if movement succeeded, False if blocked by boundary
         """
-        action_names = ['stay', 'forward', 'back', 'left', 'right',
+        action_names = ['stay', 'forward', 'back', 'turn_left', 'turn_right',
                        'strafe_left', 'strafe_right', 'look_up', 'look_down']
 
         # Save old position for collision check

@@ -860,7 +860,8 @@ class FullPipelineSimulator:
 
                 world_x = -sz   # forward (GLB -Z becomes +world_x)
                 world_y = sx    # right (GLB +X becomes +world_y)
-                world_yaw = self.sim.yaw  # No transform needed!
+                # GLB yaw is CW-positive; OccupancyMap/frontier uses CCW-positive
+                world_yaw = -self.sim.yaw  # convert CW -> CCW
             else:
                 # Fallback to spatial mapper for simple simulator
                 pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()
