@@ -260,6 +260,11 @@ class CollisionAvoidance:
         self._yaw_scan_data: List[Tuple[float, float]] = []  # (yaw, risk) pairs
         self._current_scan_yaw: float = 0.0
 
+        # Backoff rotation state (rotate 180° before backing off)
+        self._backoff_rotation_frames: int = 0
+        self._backoff_rotation_target: int = 18  # ~180° at 10°/frame
+        self._backoff_turn_direction: int = 4  # Default: turn right
+
         # Control limits (for safety)
         self.max_speed = 30  # RC control units
         self.max_yaw_rate = 30
@@ -377,10 +382,36 @@ class CollisionAvoidance:
         # Action mapping: 0=stay, 1=forward, 2=back, 3=left, 4=right
 
         if state.risk_level == RiskLevel.CRITICAL:
-            # Emergency: stop and back off
-            if debug:
-                print(f"  [COLLISION] CRITICAL - backing off")
-            return 2, "emergency_backoff"
+            # Emergency: rotate 180° to face backward, then check if clear
+            # This avoids blindly backing into walls
+
+            if self._backoff_rotation_frames < self._backoff_rotation_target:
+                # Still rotating - continue turning
+                self._backoff_rotation_frames += 1
+                if debug:
+                    print(f"  [COLLISION] CRITICAL - rotating to face backoff direction "
+                          f"({self._backoff_rotation_frames}/{self._backoff_rotation_target})")
+                return self._backoff_turn_direction, "backoff_rotation"
+            else:
+                # Finished rotating - now facing backward direction
+                # Forward (action 1) is now the backoff direction
+                # Check if it's clear via the state (which assesses forward risk)
+                if state.combined_risk < self.thresholds['high']:
+                    # Path is now clear, move forward (which is backing off)
+                    if debug:
+                        print(f"  [COLLISION] CRITICAL - backoff direction clear, moving")
+                    # Reset rotation state for next time
+                    self._backoff_rotation_frames = 0
+                    return 1, "backoff_move_forward"
+                else:
+                    # Still blocked after rotation - try staying or turning more
+                    if debug:
+                        print(f"  [COLLISION] CRITICAL - backoff direction blocked, staying")
+                    # Reset and try a different direction next time
+                    self._backoff_rotation_frames = 0
+                    # Alternate turn direction for next attempt
+                    self._backoff_turn_direction = 3 if self._backoff_turn_direction == 4 else 4
+                    return 0, "backoff_blocked_stay"
 
         elif state.risk_level == RiskLevel.HIGH:
             # High risk: stop forward motion, initiate yaw scan
@@ -408,6 +439,9 @@ class CollisionAvoidance:
 
         else:
             # LOW or NONE: proceed normally
+            # Reset backoff rotation state when safe
+            if self._backoff_rotation_frames > 0:
+                self._backoff_rotation_frames = 0
             return desired_action, "proceed"
 
     def yaw_scan(
@@ -470,6 +504,8 @@ class CollisionAvoidance:
         self._consecutive_high_risk = 0
         self._escape_in_progress = False
         self._yaw_scan_data = []
+        self._backoff_rotation_frames = 0
+        self._backoff_turn_direction = 4
 
 
 def create_collision_reflex(depth_estimator=None) -> CollisionAvoidance:

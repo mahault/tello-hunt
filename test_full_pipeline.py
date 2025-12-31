@@ -621,6 +621,10 @@ class FullPipelineSimulator:
                 self.cscg.record_blocked_action(action)
                 if debug_this_frame:
                     print(f"  [PIPELINE] Action {action} blocked at place {self.cscg._prev_token}")
+                # Mark obstacle in occupancy grid when simulator blocks
+                if action == 1 and self.use_frontier:  # Forward blocked
+                    pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()
+                    self.spatial_mapper.map.mark_obstacle_ahead(pose_x, pose_y, pose_yaw)
 
         self._last_action = action
         self._frame_count += 1
@@ -640,6 +644,12 @@ class FullPipelineSimulator:
             was_blocked = not moved or collision_blocked
             if action in [1, 2, 5, 6]:  # All movement actions
                 self.lookahead_explorer.record_block(was_blocked)
+
+        # Inform frontier explorer about blocked movements
+        if self.use_frontier:
+            was_blocked = not moved or collision_blocked
+            if action in [1, 2, 5, 6]:  # All movement actions
+                self.frontier_explorer.record_block(was_blocked)
 
         # Track room visits for analysis
         current_room = self.sim._get_current_room() if hasattr(self.sim, '_get_current_room') else "Unknown"
@@ -706,7 +716,7 @@ class FullPipelineSimulator:
                 )
 
             # Choose action using frontier-based policy
-            debug_this_frame = (self._frame_count % 30 == 0)
+            debug_this_frame = (self._frame_count % 10 == 0)  # More frequent debug
             action = self.frontier_explorer.choose_action(
                 grid=self.spatial_mapper.map.grid,
                 agent_x=pose_x,
@@ -727,7 +737,7 @@ class FullPipelineSimulator:
             if self._frame_count % 100 == 0:
                 current_room = self.sim._get_current_room() if hasattr(self.sim, '_get_current_room') else "?"
                 rooms_found = list(self._rooms_visited.keys())
-                n_frontiers = self.frontier_explorer.get_frontier_count()
+                n_frontiers = self.frontier_explorer.get_cluster_count()
                 mapper_stats = self.spatial_mapper.get_stats()
                 target = self.frontier_explorer.target
                 target_str = f"({target[0]:.1f}, {target[1]:.1f})" if target else "none"

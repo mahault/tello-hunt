@@ -238,6 +238,40 @@ class OccupancyMap:
 
         self.grid[y, x] = np.uint8(new_val)
 
+    def mark_obstacle_ahead(
+        self,
+        pose_x: float,
+        pose_y: float,
+        pose_yaw: float,
+        distance: float = 0.3,  # Distance ahead to mark as obstacle (meters)
+    ):
+        """
+        Mark an obstacle directly ahead when a movement is blocked.
+
+        This is called when the simulator blocks a forward movement,
+        indicating there's a wall/obstacle that depth sensing missed.
+
+        Args:
+            pose_x, pose_y: Current drone position in meters
+            pose_yaw: Current heading in radians
+            distance: Distance ahead to mark as obstacle
+        """
+        # Calculate obstacle position ahead of drone
+        obs_x = pose_x + distance * np.cos(pose_yaw)
+        obs_y = pose_y + distance * np.sin(pose_yaw)
+
+        obs_cx, obs_cy = self.world_to_map(obs_x, obs_y)
+
+        # Mark the obstacle cell and a few cells around it as occupied
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                cell_x = obs_cx + dx
+                cell_y = obs_cy + dy
+                if self.is_valid_cell(cell_x, cell_y):
+                    # Force to occupied (value 0)
+                    self.grid[cell_y, cell_x] = 0
+                    self.visit_count[cell_y, cell_x] += 5  # High confidence
+
     def mark_place(self, place_id: int, x: float, y: float, label: str = None):
         """
         Mark a discovered place on the map.

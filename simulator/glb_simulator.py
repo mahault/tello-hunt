@@ -167,8 +167,8 @@ class GLBSimulator:
         ceiling_y = bounds[1][1]  # Top of model
         room_height = ceiling_y - floor_y
 
-        # Start at 50% of room height (comfortable flying height)
-        drone_height = floor_y + room_height * 0.5
+        # Start at 60% of room height (higher to avoid furniture)
+        drone_height = floor_y + room_height * 0.6
 
         # Set up rooms first so we can start in a specific room
         self._setup_rooms()
@@ -208,9 +208,9 @@ class GLBSimulator:
         z_max -= margin
 
         # Store navigable bounds (including Y for floor/ceiling)
-        # Keep drone between 30% and 70% of room height
-        y_floor = y_min + (y_max - y_min) * 0.25
-        y_ceiling = y_min + (y_max - y_min) * 0.70
+        # Keep drone between 40% and 75% of room height (higher to avoid furniture)
+        y_floor = y_min + (y_max - y_min) * 0.40
+        y_ceiling = y_min + (y_max - y_min) * 0.75
         self._nav_bounds = (x_min, x_max, y_floor, y_ceiling, z_min, z_max)
 
         # Divide into 2x3 grid of rooms (typical house layout)
@@ -240,8 +240,8 @@ class GLBSimulator:
         """
         Check for obstacles using ray casting (accurate collision detection).
 
-        Casts a ray from the drone's position in the direction of movement
-        to detect walls and obstacles. Much more accurate than depth buffer.
+        Casts MULTIPLE rays in a cone from the drone's position to detect
+        walls and obstacles. Uses both forward and side-check rays for robustness.
 
         Args:
             action: Movement action (1=forward, 2=back, 5=strafe left, 6=strafe right)
@@ -268,25 +268,81 @@ class GLBSimulator:
         else:
             return False  # Non-translation action
 
-        # Ray origin (current position)
-        origin = np.array([[self.x, self.y, self.z]])
+        # Cast multiple rays for robustness:
+        # 1. Center ray
+        # 2. Left/right offset rays (catch side collisions)
+        # 3. Up/down offset rays (catch floor/ceiling)
+        ray_offsets = [
+            (0, 0, 0),           # Center
+            (-15, 0, 0),         # Left offset
+            (15, 0, 0),          # Right offset
+            (0, 10, 0),          # Up offset
+            (0, -10, 0),         # Down offset
+        ]
 
-        # Ray direction (normalized)
-        direction = np.array([[dx, 0, dz]])
+        # Also cast rays from the TARGET position back to check
+        # if we'd end up inside geometry
+        target_x = self.x + dx * self.move_speed
+        target_z = self.z + dz * self.move_speed
 
-        # Cast ray against the scene
-        # Get all meshes from trimesh scene for ray casting
+        all_origins = []
+        all_directions = []
+
+        for ox, oy, oz in ray_offsets:
+            # Rotate offset to match drone orientation
+            rotated_ox = ox * math.cos(self.yaw) - oz * math.sin(self.yaw)
+            rotated_oz = ox * math.sin(self.yaw) + oz * math.cos(self.yaw)
+
+            origin = [self.x + rotated_ox, self.y + oy, self.z + rotated_oz]
+            direction = [dx, 0, dz]
+            all_origins.append(origin)
+            all_directions.append(direction)
+
+        # Add reverse ray from target to check if target is inside geometry
+        all_origins.append([target_x, self.y, target_z])
+        all_directions.append([-dx, 0, -dz])
+
+        origins = np.array(all_origins)
+        directions = np.array(all_directions)
+
+        # Cast rays against the scene
         try:
-            # Create a ray-mesh query
             if hasattr(self.trimesh_scene, 'ray'):
-                # Scene has built-in ray casting
                 locations, index_ray, index_tri = self.trimesh_scene.ray.intersects_location(
-                    ray_origins=origin,
-                    ray_directions=direction
+                    ray_origins=origins,
+                    ray_directions=directions
                 )
+
+                if len(locations) == 0:
+                    return False  # No hit, path is clear
+
+                # Check each ray's closest hit
+                for ray_idx in range(len(origins)):
+                    ray_mask = index_ray == ray_idx
+                    if not np.any(ray_mask):
+                        continue
+
+                    ray_locations = locations[ray_mask]
+                    ray_origin = origins[ray_idx]
+                    distances = np.linalg.norm(ray_locations - ray_origin, axis=1)
+                    closest = np.min(distances)
+
+                    # For reverse ray (last one), a close hit means target is near/in geometry
+                    if ray_idx == len(origins) - 1:
+                        if closest < self.move_speed + 20:  # Hit behind us = bad target
+                            return True
+                    else:
+                        if closest < min_distance:
+                            return True
+
+                return False
+
             else:
-                # Fallback: iterate through meshes
+                # Fallback: iterate through meshes with center ray only
+                origin = np.array([[self.x, self.y, self.z]])
+                direction = np.array([[dx, 0, dz]])
                 closest_hit = float('inf')
+
                 for name, geom in self.trimesh_scene.geometry.items():
                     if isinstance(geom, trimesh.Trimesh):
                         try:
@@ -300,19 +356,7 @@ class GLBSimulator:
                         except:
                             pass
 
-                if closest_hit < min_distance:
-                    return True
-                return False
-
-            if len(locations) == 0:
-                return False  # No hit, path is clear
-
-            # Find closest intersection
-            distances = np.linalg.norm(locations - origin, axis=1)
-            closest_distance = np.min(distances)
-
-            # Blocked if closest hit is within min_distance
-            return closest_distance < min_distance
+                return closest_hit < min_distance
 
         except Exception as e:
             # Fallback to bounds check if ray casting fails
