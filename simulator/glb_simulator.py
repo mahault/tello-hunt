@@ -544,10 +544,8 @@ class GLBSimulator:
         old_room = self._get_current_room()
 
         # STRICT CHECK: Only allow movements where the camera is pointing
-        # Block backward (2) and strafe (5, 6) - camera can't see these directions
-        if action == 2:
-            print(f"  [MOVE] BLOCKED: Backward action rejected")
-            return False
+        # Block strafe (5, 6) - camera can't see sideways
+        # Allow backward (2) for escape maneuvers when stuck
         if action in (5, 6):
             print(f"  [MOVE] BLOCKED: Strafe action rejected (camera can't see sideways)")
             return False
@@ -578,9 +576,17 @@ class GLBSimulator:
             else:
                 self.x += self.move_speed * math.sin(self.yaw)
                 self.z -= self.move_speed * math.cos(self.yaw)
-        elif action == 2:  # Back - SHOULD NEVER REACH HERE
-            print(f"  [MOVE] ERROR: Backward action reached movement code!")
-            return False
+        elif action == 2:  # Backward - for escape maneuvers
+            # Check if backward is clear (simple bounds check, no ray check)
+            new_x = self.x - self.move_speed * math.sin(self.yaw)
+            new_z = self.z + self.move_speed * math.cos(self.yaw)
+            if self._is_inside_bounds(new_x, new_z):
+                self.x = new_x
+                self.z = new_z
+                print(f"  [MOVE] Backward to ({self.x:.0f},{self.z:.0f})")
+            else:
+                print(f"  [MOVE] BLOCKED backward at ({self.x:.0f}, {self.z:.0f})")
+                moved = False
         elif action == 3:  # Turn left (CCW when viewed from above)
             self.yaw += self.turn_speed   # CCW increases yaw (standard math convention)
         elif action == 4:  # Turn right (CW when viewed from above)

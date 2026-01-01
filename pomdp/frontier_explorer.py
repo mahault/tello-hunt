@@ -93,6 +93,9 @@ class FrontierExplorer:
         # Hysteresis for rotation direction (prevents oscillation at ±π)
         self._last_turn: Optional[int] = None
 
+        # Grid-block escape state (prevents endless replanning when stuck)
+        self._grid_block_streak = 0
+
     # ---------------------------
     # A* PATH PLANNING HELPERS
     # ---------------------------
@@ -766,23 +769,34 @@ class FrontierExplorer:
                     0 <= check_cell[1] < grid.shape[0]):
                     cell_val = grid[check_cell[1], check_cell[0]]
                     if cell_val < 50:  # Only block on definite obstacles (value < 50)
-                        # Direction is blocked by grid - DON'T re-mark (already an obstacle)
-                        # Just replan without marking to avoid feedback loop
-                        print(f"  [FRONTIER] Grid shows obstacle at {check_dist:.1f}m (cell={cell_val}) - replanning")
+                        # Direction is blocked by grid - implement escape behavior
+                        self._grid_block_streak += 1
+                        print(f"  [FRONTIER] Grid shows obstacle at {check_dist:.1f}m (cell={cell_val}) - streak={self._grid_block_streak}")
 
-                        # Blacklist the target to force replanning through a different route
+                        # 1) Short-term (streak 1-6): alternate turns to scan for clear direction
+                        if self._grid_block_streak <= 6:
+                            self._forward_clear_streak = 0
+                            return ROTATE_LEFT if (self._grid_block_streak % 2 == 0) else ROTATE_RIGHT
+
+                        # 2) Medium-term (streak 7): back up to unstick
+                        if self._grid_block_streak == 7:
+                            print(f"  [FRONTIER] Backing up to escape corner")
+                            self._forward_clear_streak = 0
+                            return BACKWARD
+
+                        # 3) Long-term (streak 8+): clear target and force new plan
+                        print(f"  [FRONTIER] Clearing target after escape attempts")
                         if self.target_cell is not None:
                             expiry = self._frame_count + self._blacklist_duration
                             self._blocked_targets.append((self.target_cell, expiry))
                         self.target = None
                         self.target_cell = None
                         self._current_target_blocks = 0
-                        # Invalidate planned path so we replan next tick
                         self._planned_path = []
                         self._planned_goal = None
-                        # Rotate to explore a different direction
+                        self._grid_block_streak = 0
                         self._forward_clear_streak = 0
-                        return ROTATE_LEFT if self._frame_count % 2 == 0 else ROTATE_RIGHT
+                        return ROTATE_LEFT
 
             # "Peek" before committing to forward: require consecutive clear checks
             self._forward_clear_streak += 1
@@ -790,7 +804,9 @@ class FrontierExplorer:
                 if debug:
                     print(f"  [FRONTIER] Peek {self._forward_clear_streak}/{self._forward_clear_required} (clear) -> STAY")
                 return STAY
+            # Path is clear - reset escape state and move forward
             self._forward_clear_streak = 0
+            self._grid_block_streak = 0  # Reset escape state on successful forward
             return FORWARD
 
         # Otherwise rotate toward target
@@ -859,6 +875,7 @@ class FrontierExplorer:
         self._blocked_targets = []
         self._forward_clear_streak = 0
         self._last_turn = None
+        self._grid_block_streak = 0
 
 
 def test_clustering():

@@ -267,23 +267,22 @@ class OccupancyMap:
             pose_yaw: Current heading in radians
             distance: Distance ahead to mark as obstacle
         """
-        # Mark obstacles at multiple distances ahead (0.2m, 0.3m, 0.4m)
-        # This ensures we catch the actual obstacle location
-        for dist in [0.2, 0.3, 0.4]:
+        # Mark obstacles at 2 distances ahead (0.25m, 0.35m) - not too aggressive
+        for dist in [0.25, 0.35]:
             obs_x = pose_x + dist * np.cos(pose_yaw)
             obs_y = pose_y + dist * np.sin(pose_yaw)
 
             obs_cx, obs_cy = self.world_to_map(obs_x, obs_y)
 
-            # Mark a larger area (5x5) to ensure A* doesn't route through adjacent cells
-            for dx in range(-2, 3):
-                for dy in range(-2, 3):
+            # Mark 3x3 area (smaller to avoid painting yourself into a corner)
+            for dx in range(-1, 2):
+                for dy in range(-1, 2):
                     cell_x = obs_cx + dx
                     cell_y = obs_cy + dy
                     if self.is_valid_cell(cell_x, cell_y):
                         # Force to occupied (value 0)
                         self.grid[cell_y, cell_x] = 0
-                        self.visit_count[cell_y, cell_x] += 10  # Very high confidence
+                        self.visit_count[cell_y, cell_x] += 10  # High confidence
 
         print(f"  [MAP] Marked obstacle ahead at ({pose_x:.2f},{pose_y:.2f}) yaw={np.degrees(pose_yaw):.0f}deg")
 
