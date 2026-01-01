@@ -796,6 +796,9 @@ class FullPipelineSimulator:
         if self.use_frontier:
             if original_action in [1, 2, 5, 6]:  # All translational actions
                 self.frontier_explorer.record_block(action_blocked)
+            # Report escape move results (for proper step counting)
+            if self.frontier_explorer._escape_mode and original_action == 1:  # FORWARD during escape
+                self.frontier_explorer.report_escape_move_result(original_action, moved and not action_blocked)
 
         # Track room visits for analysis
         current_room = self.sim._get_current_room() if hasattr(self.sim, '_get_current_room') else "Unknown"
@@ -857,49 +860,115 @@ class FullPipelineSimulator:
     def _scan_for_escape_direction(self) -> tuple:
         """
         Scan 360 degrees using actual sim.move() to find best escape direction.
-        Returns (best_yaw, best_distance).
+
+        Improvements over v1:
+        - Multi-step clearance (up to 5 steps) instead of single step
+        - Proper snapshot/restore of all simulator state
+        - Goal alignment tie-breaker (prefer directions toward current frontier target)
+
+        Returns (best_yaw, best_score) where score = number of successful steps.
         """
         import math
 
-        original_x = self.sim.x
-        original_z = self.sim.z
-        original_yaw = self.sim.yaw
+        # Snapshot ALL simulator state (not just x,z,yaw)
+        snapshot = self.sim.get_state_snapshot()
 
-        best_yaw = original_yaw
-        best_dist = 0.0
+        best_yaw = snapshot['yaw']
+        best_score = 0
+        best_total_dist = 0.0
 
-        print(f"  [ESCAPE-SCAN] Starting 360° scan from ({original_x:.1f}, {original_z:.1f})")
+        # Get world coords of agent (for tie-breaking bonuses)
+        start_x = self.sim.model_center[0] if hasattr(self.sim, 'model_center') else -102
+        start_z = self.sim.model_center[2] if hasattr(self.sim, 'model_center') else 333
+        world_x = -(snapshot['z'] - start_z) / 165.0
+        world_y = -(snapshot['x'] - start_x) / 165.0
+
+        # Get current frontier target for tie-breaking
+        target_heading = None
+        if hasattr(self, 'frontier_explorer') and self.frontier_explorer.target is not None:
+            tx, ty = self.frontier_explorer.target
+            target_heading = math.atan2(ty - world_y, tx - world_x)
+
+        print(f"  [ESCAPE-SCAN] Starting 360° multi-step scan from ({snapshot['x']:.1f}, {snapshot['z']:.1f})")
 
         # Try 16 directions (22.5 degree increments)
+        candidates = []
         for angle_idx in range(16):
             test_yaw = angle_idx * (2 * math.pi / 16)
 
-            # Set yaw and try forward
+            # Restore to start position for this test
+            self.sim.restore_state_snapshot(snapshot)
             self.sim.yaw = test_yaw
-            test_x, test_z = self.sim.x, self.sim.z
 
-            # Try moving forward
-            self.sim.move(1, debug=False)  # FORWARD = 1
+            # Try up to 5 forward steps, count successes
+            steps_moved = 0
+            total_dist = 0.0
+            start_x, start_z = self.sim.x, self.sim.z
 
-            # Measure how far we moved
-            dist = math.sqrt((self.sim.x - test_x)**2 + (self.sim.z - test_z)**2)
+            for step in range(5):
+                old_x, old_z = self.sim.x, self.sim.z
+                moved = self.sim.move(1, debug=False)  # FORWARD = 1
 
-            if dist > best_dist:
-                best_dist = dist
+                step_dist = math.sqrt((self.sim.x - old_x)**2 + (self.sim.z - old_z)**2)
+                if step_dist > 1.0:  # Actually moved
+                    steps_moved += 1
+                    total_dist += step_dist
+                else:
+                    break  # Hit obstacle, stop testing this direction
+
+            # Score this direction
+            score = steps_moved
+
+            # Tie-breaker 1: prefer directions closer to frontier target
+            alignment_bonus = 0.0
+            if target_heading is not None and steps_moved > 0:
+                angle_diff = abs(test_yaw - target_heading)
+                while angle_diff > math.pi:
+                    angle_diff = abs(angle_diff - 2 * math.pi)
+                # Bonus up to 0.5 for being aligned with target
+                alignment_bonus = 0.5 * (1.0 - angle_diff / math.pi)
+                score += alignment_bonus
+
+            # Tie-breaker 2: prefer directions with more unknown cells (exploration potential)
+            unknown_bonus = 0.0
+            if steps_moved > 0 and hasattr(self, 'spatial_mapper'):
+                grid = self.spatial_mapper.map.grid
+                world_to_map = self.spatial_mapper.map.world_to_map
+                # Count unknown cells in a wedge ahead (30° half-angle, 1m range)
+                unknown_count = 0
+                for dist in [0.3, 0.5, 0.7, 1.0]:
+                    for angle_offset in [-0.5, -0.25, 0, 0.25, 0.5]:  # ±30° wedge
+                        check_yaw = test_yaw + angle_offset
+                        check_x = world_x + dist * math.cos(check_yaw)
+                        check_y = world_y + dist * math.sin(check_yaw)
+                        cx, cy = world_to_map(check_x, check_y)
+                        if 0 <= cx < grid.shape[1] and 0 <= cy < grid.shape[0]:
+                            if 100 < grid[cy, cx] < 180:  # Unknown-ish
+                                unknown_count += 1
+                # Bonus up to 0.3 for unknown cells
+                unknown_bonus = min(0.3, unknown_count * 0.02)
+                score += unknown_bonus
+
+            candidates.append((test_yaw, steps_moved, total_dist, alignment_bonus + unknown_bonus))
+
+            if steps_moved > best_score or (steps_moved == best_score and total_dist > best_total_dist):
+                best_score = steps_moved
+                best_total_dist = total_dist
                 best_yaw = test_yaw
-                print(f"  [ESCAPE-SCAN] New best: yaw={math.degrees(test_yaw):.0f}° dist={dist:.1f}")
+                print(f"  [ESCAPE-SCAN] New best: yaw={math.degrees(test_yaw):.0f}° steps={steps_moved} dist={total_dist:.1f} align={alignment_bonus:.2f}")
 
-            # Restore position for next test
-            self.sim.x = original_x
-            self.sim.z = original_z
+        # Restore original state completely
+        self.sim.restore_state_snapshot(snapshot)
 
-        # Restore original state
-        self.sim.x = original_x
-        self.sim.z = original_z
-        self.sim.yaw = original_yaw
+        # Log all candidates for debugging
+        print(f"  [ESCAPE-SCAN] Candidates: ", end="")
+        for yaw, steps, dist, align in candidates:
+            if steps > 0:
+                print(f"{math.degrees(yaw):.0f}°:{steps}s ", end="")
+        print()
 
-        print(f"  [ESCAPE-SCAN] Best direction: yaw={math.degrees(best_yaw):.0f}° dist={best_dist:.1f}")
-        return best_yaw, best_dist
+        print(f"  [ESCAPE-SCAN] Best direction: yaw={math.degrees(best_yaw):.0f}° steps={best_score} dist={best_total_dist:.1f}")
+        return best_yaw, best_score
 
     def _exploration_update(self, obs: ObservationToken, loc_result, depth_map=None) -> Dict:
         """Run exploration mode update."""
@@ -981,11 +1050,11 @@ class FullPipelineSimulator:
             # === ESCAPE SCAN HANDLING ===
             # If frontier explorer needs escape scan, do 360° scan using actual sim.move()
             if self.frontier_explorer.needs_escape_scan and self.use_glb:
-                best_yaw, best_dist = self._scan_for_escape_direction()
-                if best_dist > 5.0:  # Found a direction with at least 5 sim units clearance
+                best_yaw, best_score = self._scan_for_escape_direction()
+                if best_score >= 2:  # Found a direction with at least 2 clear steps
                     self.frontier_explorer.set_escape_direction(best_yaw)
                 else:
-                    print(f"  [ESCAPE-SCAN] No clear direction found (best dist={best_dist:.1f})")
+                    print(f"  [ESCAPE-SCAN] No clear direction found (best score={best_score})")
                     self.frontier_explorer.cancel_escape()
 
             # Check if exploration is complete

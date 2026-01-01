@@ -104,6 +104,39 @@ class FrontierExplorer:
         self._escape_until_frame = 0
         self._needs_escape_scan = False  # Flag for pipeline to trigger 360° scan
 
+        # Blocked-edge memory: penalize approach direction, not target
+        # Key: (from_cell, to_cell), Value: expiry_frame
+        # When an edge is blocked, we try a different approach to the same target
+        self._blocked_edges: Dict[Tuple[Tuple[int, int], Tuple[int, int]], int] = {}
+        self._blocked_edge_ttl = 100  # Frames before edge expires
+
+    # ---------------------------
+    # BLOCKED EDGE MANAGEMENT
+    # ---------------------------
+    def record_blocked_edge(self, from_cell: Tuple[int, int], to_cell: Tuple[int, int]):
+        """Record that traversal from from_cell to to_cell was blocked."""
+        edge = (from_cell, to_cell)
+        self._blocked_edges[edge] = self._frame_count + self._blocked_edge_ttl
+        print(f"  [BLOCKED-EDGE] Recorded {from_cell} -> {to_cell} (expires frame {self._blocked_edges[edge]})")
+
+    def is_edge_blocked(self, from_cell: Tuple[int, int], to_cell: Tuple[int, int]) -> bool:
+        """Check if an edge is currently blocked (and clean up expired)."""
+        # Clean up expired edges
+        expired = [e for e, expiry in self._blocked_edges.items() if expiry <= self._frame_count]
+        for e in expired:
+            del self._blocked_edges[e]
+
+        edge = (from_cell, to_cell)
+        return edge in self._blocked_edges
+
+    def _get_blocked_neighbors(self, cell: Tuple[int, int]) -> set:
+        """Get set of cells that are blocked from this cell."""
+        blocked = set()
+        for (from_c, to_c), expiry in self._blocked_edges.items():
+            if from_c == cell and expiry > self._frame_count:
+                blocked.add(to_c)
+        return blocked
+
     # ---------------------------
     # A* PATH PLANNING HELPERS
     # ---------------------------
@@ -166,7 +199,14 @@ class FrontierExplorer:
                 path.reverse()
                 return path
 
+            # Get neighbors that are blocked from current cell (blocked-edge memory)
+            blocked_from_current = self._get_blocked_neighbors(current)
+
             for nb in self._neighbors(grid, current):
+                # Skip if this edge is blocked (tried and failed recently)
+                if nb in blocked_from_current:
+                    continue
+
                 c = self._cell_cost(grid, nb)
                 if c is None:
                     continue
@@ -279,11 +319,11 @@ class FrontierExplorer:
         """
         self._escape_mode = True
         self._escape_target_yaw = target_yaw
-        self._escape_steps_remaining = 5  # Move forward 5 times after aligning
-        self._escape_until_frame = self._frame_count + 30  # Timeout
+        self._escape_steps_remaining = 2  # Move forward only 2 times, then re-evaluate
+        self._escape_until_frame = self._frame_count + 20  # Shorter timeout
         self._needs_escape_scan = False
         self._grid_block_streak = 0
-        print(f"  [ESCAPE] Escape direction set: yaw={math.degrees(target_yaw):.1f}deg")
+        print(f"  [ESCAPE] Escape direction set: yaw={math.degrees(target_yaw):.1f}deg, steps=2")
 
     def cancel_escape(self):
         """Called if no escape direction found (all blocked)."""
@@ -291,6 +331,37 @@ class FrontierExplorer:
         self._escape_target_yaw = None
         self._needs_escape_scan = False
         # Keep grid_block_streak high so we try again soon
+
+    def report_escape_move_result(self, action: int, moved: bool):
+        """
+        Called by pipeline after executing an escape move.
+        Updates escape state based on whether the move succeeded.
+
+        Args:
+            action: The action that was executed (1=FORWARD, etc.)
+            moved: Whether the move actually changed position
+        """
+        if not self._escape_mode:
+            return
+
+        if action == 1:  # FORWARD
+            if moved:
+                # Successfully moved - decrement remaining steps
+                self._escape_steps_remaining -= 1
+                if self._escape_steps_remaining <= 0:
+                    print(f"  [ESCAPE] Escape complete - clearing path, keeping target for re-approach")
+                    self._escape_mode = False
+                    self._escape_target_yaw = None
+                    # Clear planned path to force fresh A* from new position
+                    # But DON'T blacklist the target - it may be reachable from another direction
+                    self._planned_path = []
+                    self._planned_goal = None
+            else:
+                # Forward was blocked during escape - abort and request new scan
+                print(f"  [ESCAPE] Blocked during escape - aborting, will re-scan")
+                self._escape_mode = False
+                self._escape_target_yaw = None
+                self._needs_escape_scan = True  # Request new scan immediately
 
     def extract_frontiers(
         self,
@@ -597,15 +668,9 @@ class FrontierExplorer:
                         print(f"  [ESCAPE] Rotating toward escape heading (error={math.degrees(heading_error):.1f}deg)")
                     return ROTATE_LEFT if heading_error > 0 else ROTATE_RIGHT
 
-                # Aligned - move forward
-                self._escape_steps_remaining -= 1
-                if self._escape_steps_remaining <= 0:
-                    print(f"  [ESCAPE] Escape complete - resuming normal exploration")
-                    self._escape_mode = False
-                    self._escape_target_yaw = None
-                else:
-                    if debug:
-                        print(f"  [ESCAPE] Moving forward ({self._escape_steps_remaining} steps remaining)")
+                # Aligned - move forward (pipeline will call report_escape_move_result to track success)
+                if debug:
+                    print(f"  [ESCAPE] Moving forward ({self._escape_steps_remaining} steps remaining)")
                 return FORWARD
 
         # Count explored cells to determine phase
@@ -841,6 +906,9 @@ class FrontierExplorer:
                         self._grid_block_streak += 1
                         print(f"  [FRONTIER] Grid obstacle at dist={check_dist:.1f}m cell={check_cell} val={cell_val} streak={self._grid_block_streak}")
 
+                        # Record blocked edge so A* will try different approach next time
+                        self.record_blocked_edge(agent_cell, check_cell)
+
                         # 1) Short-term (streak 1-4): alternate turns to scan for clear direction
                         if self._grid_block_streak <= 4:
                             self._forward_clear_streak = 0
@@ -955,6 +1023,8 @@ class FrontierExplorer:
         self._escape_steps_remaining = 0
         self._escape_until_frame = 0
         self._needs_escape_scan = False
+        # Blocked edge memory reset
+        self._blocked_edges = {}
 
 
 def test_clustering():

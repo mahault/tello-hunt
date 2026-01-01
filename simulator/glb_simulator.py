@@ -669,6 +669,34 @@ class GLBSimulator:
                 return room_name
         return "Unknown"
 
+    def get_state_snapshot(self) -> dict:
+        """
+        Get a snapshot of all mutable simulator state.
+        Used for non-destructive escape scanning.
+        """
+        return {
+            'x': self.x,
+            'y': self.y,
+            'z': self.z,
+            'yaw': self.yaw,
+            'pitch': self.pitch,
+            '_collision_ema': self._collision_ema,
+            '_consecutive_blocked': self._consecutive_blocked,
+        }
+
+    def restore_state_snapshot(self, snapshot: dict):
+        """
+        Restore simulator state from a snapshot.
+        Used for non-destructive escape scanning.
+        """
+        self.x = snapshot['x']
+        self.y = snapshot['y']
+        self.z = snapshot['z']
+        self.yaw = snapshot['yaw']
+        self.pitch = snapshot['pitch']
+        self._collision_ema = snapshot['_collision_ema']
+        self._consecutive_blocked = snapshot['_consecutive_blocked']
+
     def _draw_minimap(self, frame: np.ndarray, size: int = 100):
         """Draw a small top-down minimap."""
         margin = 10
