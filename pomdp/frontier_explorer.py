@@ -96,6 +96,9 @@ class FrontierExplorer:
         # Grid-block escape state (prevents endless replanning when stuck)
         self._grid_block_streak = 0
 
+        # Forward cooldown after escape (prevents BACKWARD→FORWARD undo loop)
+        self._no_forward_until_frame = 0
+
     # ---------------------------
     # A* PATH PLANNING HELPERS
     # ---------------------------
@@ -782,6 +785,8 @@ class FrontierExplorer:
                         if self._grid_block_streak == 7:
                             print(f"  [FRONTIER] Backing up to escape corner")
                             self._forward_clear_streak = 0
+                            # Set cooldown to prevent immediate FORWARD after backing up
+                            self._no_forward_until_frame = self._frame_count + 15
                             return BACKWARD
 
                         # 3) Long-term (streak 8+): clear target and force new plan
@@ -804,6 +809,13 @@ class FrontierExplorer:
                 if debug:
                     print(f"  [FRONTIER] Peek {self._forward_clear_streak}/{self._forward_clear_required} (clear) -> STAY")
                 return STAY
+            # Path is clear - but check for escape cooldown first
+            if self._frame_count < self._no_forward_until_frame:
+                # Still in cooldown after escape - rotate to find new heading
+                if debug:
+                    print(f"  [FRONTIER] Forward blocked by escape cooldown ({self._no_forward_until_frame - self._frame_count} frames)")
+                return ROTATE_LEFT if (self._frame_count % 2 == 0) else ROTATE_RIGHT
+
             # Path is clear - reset escape state and move forward
             self._forward_clear_streak = 0
             self._grid_block_streak = 0  # Reset escape state on successful forward

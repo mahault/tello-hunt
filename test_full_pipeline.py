@@ -747,6 +747,10 @@ class FullPipelineSimulator:
                     debug=debug_this_frame
                 )
 
+                # DEBUG: Track position after BACKWARD
+                if action == 2:
+                    print(f"  [AFTER-ACTION] action=BACKWARD sim.x={self.sim.x:.2f} sim.z={self.sim.z:.2f} moved={moved}")
+
                 # Report movement result to exploration (for wall detection)
                 if self.mode == "exploration":
                     self.exploration.record_movement_result(action, moved and not action_blocked)
@@ -1454,6 +1458,9 @@ def main():
 
     while True:
         frame_count += 1
+
+        # DEBUG: Check for teleporting after backward
+        print(f"  [LOOP-START] frame={frame_count} sim.x={pipeline.sim.x:.2f} sim.z={pipeline.sim.z:.2f}")
 
         # Run update
         result = pipeline.update(manual_action=manual_action)
