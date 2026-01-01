@@ -880,8 +880,17 @@ class FullPipelineSimulator:
 
                 world_x = -sz   # forward (GLB -Z becomes +world_x)
                 world_y = sx    # right (GLB +X becomes +world_y)
-                # GLB yaw is CW-positive; OccupancyMap/frontier uses CCW-positive
-                world_yaw = -self.sim.yaw  # convert CW -> CCW
+                # In our world frame (x = forward = -Z, y = right = +X),
+                # sim.yaw already matches the cos/sin convention:
+                #   forward in world = (cos(yaw), sin(yaw))
+                world_yaw = self.sim.yaw  # NO negation needed
+
+                # DEBUG: Verify yaw convention matches
+                if self._frame_count % 100 == 0:
+                    sim_fwd_world = (math.cos(self.sim.yaw), math.sin(self.sim.yaw))
+                    planner_fwd = (math.cos(world_yaw), math.sin(world_yaw))
+                    print(f"  [YAW-CHECK] sim_fwd_world={sim_fwd_world[0]:.2f},{sim_fwd_world[1]:.2f} "
+                          f"planner_fwd={planner_fwd[0]:.2f},{planner_fwd[1]:.2f}")
 
                 # Cache GLB world pose for debugging and obstacle stamping comparison
                 self._glb_world_pose = (world_x, world_y, world_yaw)
