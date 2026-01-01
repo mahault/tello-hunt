@@ -1056,9 +1056,9 @@ For VBGS (Phase 12) - **separate environment**:
 
 ---
 
-## Critical Bug Fixes (Dec 2025)
+## Critical Bug Fixes (Dec 2025 - Jan 2026)
 
-All fixes implemented and ready for testing.
+All fixes implemented and tested.
 
 ### Issue 1: Occupancy map uint8 overflow ✓ FIXED
 **File:** `utils/occupancy_map.py`
@@ -1080,6 +1080,105 @@ current = int(self.grid[y, x])
 new_val = min(255, current + self.config.free_increment)
 self.grid[y, x] = np.uint8(new_val)
 ```
+
+### Issue 7: Doorways painted as obstacles ✓ FIXED (Jan 2026)
+**Files:** `utils/occupancy_map.py`, `pomdp/frontier_explorer.py`
+
+**Problem:** Depth sensing at an angle would mark doorway openings as obstacles. When looking at a doorway from the side, rays hit walls on either side and the 3x3 obstacle dilation "painted over" the actual opening.
+
+**Symptoms:**
+- Doorway band diagnostic shows `[    #####  ]` (5 consecutive obstacles)
+- A* cannot find path through doorways
+- Drone gets stuck at room boundaries
+
+**Root Cause:**
+- Depth-based obstacles used same 3x3 dilation as collision obstacles
+- No distinction between "I see something far away" vs "I hit a wall"
+- Single depth hit could forbid entire doorway
+
+**Fix (Two-Tier Obstacle System):**
+
+1. **Depth-sensed obstacles** (low confidence):
+   - Single cell marking (no dilation)
+   - Floor at value 60 (not 0)
+   - Can be overwritten by free-space carving
+   ```python
+   new_val = max(self.config.depth_obstacle, current - self.config.depth_occupied_increment)
+   ```
+
+2. **Collision-confirmed obstacles** (high confidence):
+   - 3x3 dilation (unchanged)
+   - Value 0, locked with high visit count
+   - Cannot be overwritten by depth
+
+3. **Grid obstacle gating** (frontier explorer):
+   - Changed threshold from `< 50` to `< 30`
+   - Only blocks on collision-confirmed obstacles
+   ```python
+   # Only block on COLLISION-CONFIRMED obstacles (value < 30)
+   # Depth-sensed obstacles floor at ~60, so this avoids false blocking
+   if cell_val < 30:
+   ```
+
+**Results:**
+- Doorway bands now show 0 obstacle cells (vs 5 before)
+- Total obstacles reduced from 51 to 8 (collision-confirmed only)
+- Room transitions now pathable
+
+### Issue 8: Escape scan mutating simulator state ✓ FIXED (Jan 2026)
+**Files:** `simulator/glb_simulator.py`, `test_full_pipeline.py`
+
+**Problem:** When scanning 360° to find escape direction, each test move permanently changed simulator state (room transitions, position drift).
+
+**Fix:** Added snapshot/restore methods:
+```python
+def get_state_snapshot(self) -> dict:
+    return {'x': self.x, 'y': self.y, 'z': self.z, 'yaw': self.yaw, ...}
+
+def restore_state_snapshot(self, snapshot: dict):
+    self.x = snapshot['x']
+    ...
+```
+
+### Issue 9: Escape mode counting blocked steps ✓ FIXED (Jan 2026)
+**File:** `pomdp/frontier_explorer.py`
+
+**Problem:** Escape step counter decremented even when movement was blocked, so escape would "complete" while still stuck.
+
+**Fix:** `report_escape_move_result()` only decrements on successful forward:
+```python
+if action == 1:  # FORWARD
+    if moved:
+        self._escape_steps_remaining -= 1
+    else:
+        # Blocked during escape - abort and re-scan
+        self._escape_mode = False
+        self._needs_escape_scan = True
+```
+
+### Issue 10: Oscillation after escape ✓ FIXED (Jan 2026)
+**File:** `pomdp/frontier_explorer.py`
+
+**Problem:** After successful escape, A* would immediately re-plan to same blocked target, causing oscillation.
+
+**Root Cause:** Target was blacklisted, but the *approach direction* wasn't remembered. New path would use same blocked approach.
+
+**Fix (Blocked-Edge Memory):**
+```python
+# Record blocked edges with TTL
+self._blocked_edges: Dict[Tuple[Tuple[int,int], Tuple[int,int]], int] = {}
+
+def record_blocked_edge(self, from_cell, to_cell):
+    edge = (from_cell, to_cell)
+    self._blocked_edges[edge] = self._frame_count + self._blocked_edge_ttl
+
+# A* skips blocked edges
+for nb in self._neighbors(grid, current):
+    if nb in self._get_blocked_neighbors(current):
+        continue
+```
+
+Also: `report_escape_move_result()` clears path but keeps target, forcing fresh A* from new position.
 
 ### Issue 2: Ellipsis in escape_actions list ✓ CHECKED
 **File:** `pomdp/exploration_mode.py`

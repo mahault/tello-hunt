@@ -1,18 +1,27 @@
 # Tello Hunt
 
-Autonomous drone tracking experiments using DJI Tello/Tello Talent with YOLO object detection.
+Autonomous drone tracking and exploration using DJI Tello/Tello Talent with YOLO object detection and Active Inference (POMDP-based decision making).
 
 ## Features
 
-- **Person Tracking**: Autonomous search, approach, signal, and backoff behavior
+### Core Capabilities
+- **Autonomous Exploration**: Frontier-based exploration with topological mapping
+- **Person Tracking**: Search, approach, signal, and backoff behavior
 - **Cat Shadowing**: Follow cats while avoiding people (safety-first design)
-- **Failsafe Landing**: All scripts include emergency landing on quit or error
+- **3D Simulation**: Test algorithms without physical drone using GLB house models
+
+### Technical Stack
+- **JAX JIT Compilation**: Real-time POMDP inference
+- **Three-Layer POMDP**: World Model + Human Search + Interaction Mode
+- **ORB Place Recognition**: 87.5% accuracy in realistic environments
+- **Hybrid Collision Avoidance**: Optical flow + monocular depth
+- **Occupancy Grid Mapping**: Depth-based spatial mapping with free-space carving
 
 ## Requirements
 
 - Python 3.10+
-- DJI Tello or Tello Talent drone
-- YOLOv8n weights file
+- DJI Tello or Tello Talent drone (for real flight)
+- CUDA-capable GPU (recommended for depth estimation)
 
 ## Installation
 
@@ -22,111 +31,189 @@ conda env create -f environment.yml
 conda activate tello-hunt
 
 # Or with pip
-pip install opencv-python djitellopy ultralytics keyboard
+pip install opencv-python djitellopy ultralytics keyboard jax transformers
 
 # Download YOLO weights (run once)
 python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 ```
 
-## Getting Started
+## Quick Start
 
-### Step 1: Connect to Drone
+### Option 1: Simulation (No Drone Required)
 
+Test the full exploration system in 3D simulation:
+
+```bash
+# Frontier-based exploration (recommended)
+python test_full_pipeline.py --frontier
+
+# Topological exploration
+python test_full_pipeline.py --topological
+
+# Semantic exploration with room priors
+python test_full_pipeline.py --semantic
+```
+
+### Option 2: Real Drone
+
+#### Step 1: Connect to Drone
 1. Power on the drone
 2. Connect your computer to the drone's WiFi (TELLO-XXXXXX)
 
-### Step 2: Test Command Connection
-
+#### Step 2: Test Connection
 ```bash
+# Test commands
 python cmd_debug.py
-```
 
-This tests the SDK command interface:
-- Connects to drone and shows battery level
-- Non-blocking keyboard controls: T=takeoff, L=land, Q=quit, E=emergency
-- Prints height telemetry every 2 seconds while running
-
-Use this to verify your drone responds to commands before testing video.
-
-### Step 3: Test Video Stream
-
-```bash
+# Test video stream
 python video_debug_pyav.py
 ```
 
-This tests the video stream:
-- Starts the H.264 video stream on UDP port 11111
-- Opens a window displaying live video from the drone
-- Press Q in the window to quit
-
-Use this to verify video works before running tracking applications.
-
-### Step 4: Run Applications
-
-Once both command and video work:
-
+#### Step 3: Run Applications
 ```bash
-# Person tracking demo
+# Person tracking with POMDP
+python person_hunter_pomdp.py
+
+# Simple person tracking
 python person_hunter_safe.py
 
-# Cat shadowing with person avoidance
+# Cat shadowing with safety
 python cat_safe_shadow.py
 ```
 
-## Scripts
+## Project Structure
 
-### Debugging Tools
+```
+tello-hunt/
+├── pomdp/                    # POMDP inference engine (~2.5K lines)
+│   ├── core.py              # JAX JIT belief updates, EFE
+│   ├── world_model.py       # Semantic localization
+│   ├── frontier_explorer.py # Frontier-based navigation
+│   ├── human_search.py      # Person location tracking
+│   └── interaction_mode.py  # Action selection via Active Inference
+│
+├── mapping/                  # Place recognition & mapping
+│   ├── cscg/                # Clone-Structured Cognitive Graphs
+│   └── semantic_world_model.py
+│
+├── simulator/                # 3D testing environment
+│   ├── glb_simulator.py     # GLB model renderer (pyrender)
+│   └── simple_3d.py         # Lightweight raycasting sim
+│
+├── safety/                   # Safety monitoring (outside POMDP)
+│   └── overrides.py         # Battery, collision detection
+│
+├── utils/                    # Utilities
+│   ├── occupancy_map.py     # Spatial grid mapping
+│   ├── collision_avoidance.py
+│   └── depth_estimator.py
+│
+├── person_hunter_pomdp.py   # Full POMDP hunting
+├── person_hunter_safe.py    # Simple tracking
+└── test_full_pipeline.py    # Simulation testing
+```
 
-| Script | Purpose |
-|--------|---------|
-| `cmd_debug.py` | Test SDK commands - battery queries, takeoff/land with keyboard |
-| `video_debug_pyav.py` | Test video stream - verify H.264 decoding works |
+## Exploration Modes
 
-### Applications
+### Frontier-Based (Recommended)
+```bash
+python test_full_pipeline.py --frontier
+```
+- Standard robotics approach: explore boundaries between known/unknown space
+- A* pathfinding to frontier targets
+- Escape strategies for stuck situations
+- Blocked-edge memory to avoid repeated failures
 
-| Script | Description |
-|--------|-------------|
-| `person_hunter_safe.py` | Search for people, approach, signal when in range, back off and land |
-| `cat_safe_shadow.py` | Shadow cats at safe distance; backs away if person detected |
+### Topological
+```bash
+python test_full_pipeline.py --topological
+```
+- Pure place-graph navigation
+- BFS to find nearest unexplored transitions
+- Good for structured environments
 
-### Utilities
-
-| Script | Description |
-|--------|-------------|
-| `fly_square.py` | Simple autonomous square flight pattern |
-| `tello_connect_wifi.py` | One-time setup to connect drone to home WiFi |
+### Semantic (Experimental)
+```bash
+python test_full_pipeline.py --semantic
+```
+- EFE-based exploration with room/object priors
+- Seeks specific room types (kitchen, bedroom, etc.)
+- YOLO object detection for room classification
 
 ## Controls
 
-| Script | Start | Stop | Other |
-|--------|-------|------|-------|
-| `cmd_debug.py` | T | Q | L=land, E=emergency |
-| `video_debug_pyav.py` | Auto | Q (window) | - |
-| `person_hunter_safe.py` | ENTER | Q (window) | - |
-| `cat_safe_shadow.py` | T | Q | H = hover |
-| `fly_square.py` | Auto | Q (hold key) | - |
+| Mode | Key | Action |
+|------|-----|--------|
+| All | Q/ESC | Quit |
+| All | SPACE | Toggle auto/manual |
+| All | R | Reset |
+| Manual | W/Up | Forward |
+| Manual | S/Down | Backward |
+| Manual | A/Left | Turn left |
+| Manual | D/Right | Turn right |
+
+## Configuration
+
+### POMDP Settings (`pomdp/config.py`)
+- `N_MAX_LOCATIONS = 50` - Maximum learned places
+- `LOCATION_SIMILARITY_THRESHOLD = 0.5` - Place matching
+- `ACTION_TEMPERATURE = 2.0` - Exploration vs exploitation
+
+### Safety Settings (`safety/overrides.py`)
+- Battery warning: 20%
+- Battery critical: 10%
+- Collision detection: 5 consecutive blocked frames
+
+### Occupancy Mapping (`utils/occupancy_map.py`)
+- Resolution: 10cm per cell
+- Depth obstacles: value 60 (low confidence)
+- Collision obstacles: value 0 (locked, high confidence)
 
 ## Troubleshooting
 
-### Drone not responding to commands
+### Drone Issues
+1. **Not responding**: Check WiFi connection to TELLO-XXXXXX
+2. **Video not working**: Ensure port 11111 isn't blocked
+3. **Erratic behavior**: Check battery level (won't fly < 10%)
 
-1. Verify WiFi connection to TELLO-XXXXXX
-2. Run `cmd_debug.py` - should show battery percentage
-3. Check battery (won't respond if critically low)
-4. Default IP is `192.168.10.1` for direct connection mode
+### Simulation Issues
+1. **GLB not loading**: Install `pip install pyrender trimesh`
+2. **Slow rendering**: Reduce window size or disable depth estimation
+3. **Stuck in corners**: Escape logic triggers after 5 consecutive blocks
 
-### Video stream not working
+### Exploration Issues
+1. **Not finding doors**: Check occupancy map for false obstacles
+2. **Oscillating at boundaries**: Blocked-edge memory should prevent this
+3. **Never leaving room**: Verify doorway regions aren't painted as walls
 
-1. First confirm commands work with `cmd_debug.py`
-2. Run `video_debug_pyav.py`
-3. Check that port 11111 isn't blocked by firewall
-4. Try power cycling the drone
+## Technical Details
 
-### YOLO model missing
+### Three-Layer POMDP Architecture
 
-```bash
-python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 ```
+YOLO Frame → ObservationToken → WorldModel → [Exploration | Hunting] → RC Control
+                                    ↓
+                             Safety Monitor (highest priority)
+```
+
+1. **World Model**: Soft belief over 50 learned locations
+2. **Human Search**: Belief over person locations
+3. **Interaction Mode**: EFE-based action selection
+
+### Occupancy Grid Mapping
+
+Two types of obstacles with different confidence:
+- **Depth-sensed** (value ~60): Single cell, can be overwritten
+- **Collision-confirmed** (value 0): 3x3 dilation, locked
+
+This prevents doorways from being "painted over" by depth sensing at angles.
+
+### Escape Strategies
+
+When stuck (5+ consecutive blocks):
+1. **Short-term (1-4 blocks)**: Alternate left/right turns
+2. **Medium-term (5-9 blocks)**: 360° scan for clear direction
+3. **Long-term (10+ blocks)**: Blacklist target, select new goal
 
 ## Safety
 
@@ -134,4 +221,10 @@ python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 - Keep line of sight with the drone
 - All scripts auto-land on exit or error
 - Speed limits are conservative by default
-- Person detection triggers immediate backoff in cat mode
+- Safety monitor runs independently of POMDP
+
+## References
+
+- [Bio-Inspired Topological Navigation](https://arxiv.org/html/2508.07267) - Active Inference approach
+- [Clone-Structured Cognitive Graphs](https://github.com/vicariousinc/naturecomm_cscg) - Perceptual aliasing
+- [pymdp](https://github.com/infer-actively/pymdp) - Active inference library
