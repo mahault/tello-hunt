@@ -749,8 +749,17 @@ class FullPipelineSimulator:
                         print(f"  [PIPELINE] Action {action} blocked at place {self.cscg._prev_token}")
                     # Mark obstacle in occupancy grid when simulator blocks
                     if original_action in (1, 2, 5, 6) and self.use_frontier:  # Any translational blocked
-                        pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()
-                        self.spatial_mapper.map.mark_obstacle_ahead(pose_x, pose_y, pose_yaw)
+                        # Use cached GLB pose (not drifting odometry) for obstacle stamping
+                        if self.use_glb and hasattr(self, '_glb_world_pose'):
+                            wx, wy, wyaw = self._glb_world_pose
+                            # DEBUG: Compare GLB world pose vs odometry pose
+                            pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()
+                            print(f"  [POSE-DEBUG] GLB world=({wx:.2f}, {wy:.2f}, {math.degrees(wyaw):.0f}deg) "
+                                  f"odometry=({pose_x:.2f}, {pose_y:.2f}, {math.degrees(pose_yaw):.0f}deg)")
+                            self.spatial_mapper.map.mark_obstacle_ahead(wx, wy, wyaw)
+                        else:
+                            pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()
+                            self.spatial_mapper.map.mark_obstacle_ahead(pose_x, pose_y, pose_yaw)
 
         self._last_action = action
         self._frame_count += 1
@@ -798,11 +807,22 @@ class FullPipelineSimulator:
             # Use ground truth room from simulator
             place_label = self.sim._get_current_room()
 
+        # In GLB+frontier mode, we already updated the occupancy grid with the correct
+        # GLB-derived pose in _exploration_update(). Don't double-update with bad odometry.
+        depth_for_mapper = None if (self.use_glb and self.use_frontier) else depth_map
+
+        # Sync odometry pose to GLB for consistent reporting/debug
+        if self.use_glb and hasattr(self, '_glb_world_pose'):
+            wx, wy, wyaw = self._glb_world_pose
+            self.spatial_mapper.odometry.pose.x = wx
+            self.spatial_mapper.odometry.pose.y = wy
+            self.spatial_mapper.odometry.pose.yaw = wyaw
+
         self.spatial_mapper.update(
             frame=frame,
             action=action,
             moved=moved,
-            depth_map=depth_map,
+            depth_map=depth_for_mapper,
             place_id=place_id,
             place_label=place_label,
         )
@@ -862,6 +882,9 @@ class FullPipelineSimulator:
                 world_y = sx    # right (GLB +X becomes +world_y)
                 # GLB yaw is CW-positive; OccupancyMap/frontier uses CCW-positive
                 world_yaw = -self.sim.yaw  # convert CW -> CCW
+
+                # Cache GLB world pose for debugging and obstacle stamping comparison
+                self._glb_world_pose = (world_x, world_y, world_yaw)
             else:
                 # Fallback to spatial mapper for simple simulator
                 pose_x, pose_y, pose_yaw = self.spatial_mapper.get_pose()

@@ -495,8 +495,23 @@ class GLBSimulator:
         # Create camera transformation matrix
         pose = np.eye(4)
 
-        # Rotation
-        pose[:3, :3] = self._rotation_matrix(self.yaw, self.pitch)
+        # Rotation - flip yaw sign to match pyrender camera convention with motion
+        # Motion uses sin(yaw)/cos(yaw) but pyrender camera forward is mirrored
+        pose[:3, :3] = self._rotation_matrix(-self.yaw, self.pitch)
+
+        # DEBUG: Compare camera forward vs motion forward
+        # Motion forward: (sin(yaw), -cos(yaw)) in XZ plane
+        # Camera forward from rotation matrix: -Z column (pose[:3, 2]) but negated
+        motion_fwd = (math.sin(self.yaw), -math.cos(self.yaw))
+        cam_fwd_xz = (-pose[0, 2], -pose[2, 2])  # Camera looks down -Z
+        if hasattr(self, '_debug_frame_count'):
+            self._debug_frame_count += 1
+        else:
+            self._debug_frame_count = 0
+        if self._debug_frame_count % 100 == 0:
+            print(f"  [CAM-DEBUG] yaw={math.degrees(self.yaw):.0f}deg "
+                  f"motion_fwd=({motion_fwd[0]:.2f}, {motion_fwd[1]:.2f}) "
+                  f"cam_fwd=({cam_fwd_xz[0]:.2f}, {cam_fwd_xz[1]:.2f})")
 
         # Translation
         pose[0, 3] = self.x
