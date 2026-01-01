@@ -901,7 +901,9 @@ class FrontierExplorer:
                 if (0 <= check_cell[0] < grid.shape[1] and
                     0 <= check_cell[1] < grid.shape[0]):
                     cell_val = grid[check_cell[1], check_cell[0]]
-                    if cell_val < 50:  # Only block on definite obstacles (value < 50)
+                    # Only block on COLLISION-CONFIRMED obstacles (value < 30)
+                    # Depth-sensed obstacles floor at ~60, so this avoids false blocking at doorways
+                    if cell_val < 30:
                         # Direction is blocked by grid - implement escape behavior
                         self._grid_block_streak += 1
                         print(f"  [FRONTIER] Grid obstacle at dist={check_dist:.1f}m cell={check_cell} val={cell_val} streak={self._grid_block_streak}")

@@ -29,11 +29,13 @@ class MapConfig:
     # Occupancy values
     unknown: int = 127         # Unknown space
     free: int = 255            # Free space
-    occupied: int = 0          # Obstacle
+    occupied: int = 0          # Obstacle (collision-confirmed)
+    depth_obstacle: int = 60   # Depth-sensed obstacle (low confidence)
 
     # Update parameters
     free_increment: int = 10   # How much to increase free confidence
-    occupied_increment: int = 30  # How much to increase occupied confidence
+    occupied_increment: int = 30  # How much to increase occupied confidence (collision)
+    depth_occupied_increment: int = 12  # Weaker for depth-based obstacles
 
 
 class OccupancyMap:
@@ -224,28 +226,46 @@ class OccupancyMap:
             else:
                 self._update_cell(x1, y1, free=True)
 
-    def _update_cell(self, x: int, y: int, free: bool):
-        """Update a cell's occupancy."""
+    def _update_cell(self, x: int, y: int, free: bool, source: str = 'depth'):
+        """
+        Update a cell's occupancy.
+
+        Args:
+            x, y: Cell coordinates
+            free: True = mark as free, False = mark as obstacle
+            source: 'depth' for depth-sensed, 'collision' for collision-confirmed
+        """
         if not self.is_valid_cell(x, y):
             return
 
         # Convert to int to avoid uint8 overflow before min/max
         current = int(self.grid[y, x])
 
-        # CRITICAL: Don't overwrite cells that have been explicitly marked as obstacles
+        # CRITICAL: Don't overwrite collision-locked obstacles
         # (high visit count + low value = locked obstacle from collision detection)
         if current < 10 and self.visit_count[y, x] >= 5:
-            # This cell was explicitly blocked - don't update it
-            return
-
-        self.visit_count[y, x] += 1
+            # This cell was collision-confirmed - only collision can update it
+            if source != 'collision':
+                return
 
         if free:
             # Increase free confidence
+            # But don't clear depth-sensed obstacles too aggressively
+            if current < self.config.depth_obstacle and source == 'depth':
+                # Don't let depth free-carving clear other depth obstacles
+                return
             new_val = min(255, current + self.config.free_increment)
+            self.visit_count[y, x] += 1
         else:
-            # Increase occupied confidence
-            new_val = max(0, current - self.config.occupied_increment)
+            # Mark as obstacle - different handling for depth vs collision
+            if source == 'collision':
+                # Collision-confirmed: strong, goes to 0
+                new_val = max(0, current - self.config.occupied_increment)
+                self.visit_count[y, x] += 3  # Higher confidence
+            else:
+                # Depth-sensed: weaker, floor at depth_obstacle level
+                new_val = max(self.config.depth_obstacle, current - self.config.depth_occupied_increment)
+                self.visit_count[y, x] += 1
 
         self.grid[y, x] = np.uint8(new_val)
 
@@ -262,29 +282,31 @@ class OccupancyMap:
         This is called when the simulator blocks a forward movement,
         indicating there's a wall/obstacle that depth sensing missed.
 
+        COLLISION-CONFIRMED obstacles get 3x3 dilation and are locked.
+
         Args:
             pose_x, pose_y: Current drone position in meters
             pose_yaw: Current heading in radians
             distance: Distance ahead to mark as obstacle
         """
-        # Mark obstacles at 2 distances ahead (0.25m, 0.35m) - not too aggressive
+        # Mark obstacles at 2 distances ahead (0.25m, 0.35m)
         for dist in [0.25, 0.35]:
             obs_x = pose_x + dist * np.cos(pose_yaw)
             obs_y = pose_y + dist * np.sin(pose_yaw)
 
             obs_cx, obs_cy = self.world_to_map(obs_x, obs_y)
 
-            # Mark 3x3 area (smaller to avoid painting yourself into a corner)
+            # Mark 3x3 area for collision-confirmed obstacles
             for dx in range(-1, 2):
                 for dy in range(-1, 2):
                     cell_x = obs_cx + dx
                     cell_y = obs_cy + dy
                     if self.is_valid_cell(cell_x, cell_y):
-                        # Force to occupied (value 0)
+                        # Use collision source - force to 0 and lock
                         self.grid[cell_y, cell_x] = 0
-                        self.visit_count[cell_y, cell_x] += 10  # High confidence
+                        self.visit_count[cell_y, cell_x] += 10  # High confidence = locked
 
-        print(f"  [MAP] Marked obstacle ahead at ({pose_x:.2f},{pose_y:.2f}) yaw={np.degrees(pose_yaw):.0f}deg")
+        print(f"  [MAP] Marked collision obstacle at ({pose_x:.2f},{pose_y:.2f}) yaw={np.degrees(pose_yaw):.0f}deg")
 
     def mark_place(self, place_id: int, x: float, y: float, label: str = None):
         """
