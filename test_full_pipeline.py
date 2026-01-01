@@ -885,12 +885,13 @@ class FullPipelineSimulator:
                 #   forward in world = (cos(yaw), sin(yaw))
                 world_yaw = self.sim.yaw  # NO negation needed
 
-                # DEBUG: Verify yaw convention matches
-                if self._frame_count % 100 == 0:
+                # DEBUG: Verify yaw convention matches - log more frequently during rotation issues
+                if self._frame_count % 20 == 0:
                     sim_fwd_world = (math.cos(self.sim.yaw), math.sin(self.sim.yaw))
                     planner_fwd = (math.cos(world_yaw), math.sin(world_yaw))
-                    print(f"  [YAW-CHECK] sim_fwd_world={sim_fwd_world[0]:.2f},{sim_fwd_world[1]:.2f} "
-                          f"planner_fwd={planner_fwd[0]:.2f},{planner_fwd[1]:.2f}")
+                    print(f"  [YAW-CHECK] sim.yaw={math.degrees(self.sim.yaw):.1f}deg "
+                          f"world_yaw={math.degrees(world_yaw):.1f}deg "
+                          f"pos=({world_x:.2f},{world_y:.2f})")
 
                 # Cache GLB world pose for debugging and obstacle stamping comparison
                 self._glb_world_pose = (world_x, world_y, world_yaw)

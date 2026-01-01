@@ -90,6 +90,9 @@ class FrontierExplorer:
         self._planned_path: List[Tuple[int, int]] = []
         self._planned_goal: Optional[Tuple[int, int]] = None
 
+        # Hysteresis for rotation direction (prevents oscillation at ±π)
+        self._last_turn: Optional[int] = None
+
     # ---------------------------
     # A* PATH PLANNING HELPERS
     # ---------------------------
@@ -169,6 +172,9 @@ class FrontierExplorer:
         """
         Pick a goal cell inside the cluster that is cheapest to reach via A*.
         Returns the best path, or None.
+
+        IMPORTANT: Rejects trivial goals that are too close to the agent,
+        which prevents the "oscillating at own cell" failure mode.
         """
         best_path = None
         best_cost = float("inf")
@@ -180,12 +186,34 @@ class FrontierExplorer:
             step = max(1, len(candidates) // 40)
             candidates = candidates[::step]
 
+        # Forbid trivial goals near the agent (prevents self-selection)
+        min_goal_dist_cells = 4  # At least 4 cells away
+        min_goal_dist2 = min_goal_dist_cells * min_goal_dist_cells
+        min_path_len = 4  # Reject degenerate short paths
+
+        ax, ay = agent_cell
+
         for goal in candidates:
             if self._is_blacklisted(goal):
                 continue
+
+            # NEW: Reject goals too close to agent
+            dx = goal[0] - ax
+            dy = goal[1] - ay
+            if (dx * dx + dy * dy) <= min_goal_dist2:
+                continue
+
             path = self._astar(grid, agent_cell, goal)
             if path is None:
                 continue
+
+            # DEBUG: Log goal selection to diagnose trivial-goal issues
+            print(f"  [A*-DEBUG] agent_cell={agent_cell} goal={goal} path_len={len(path)}")
+
+            # NEW: Reject degenerate paths
+            if len(path) < min_path_len:
+                continue
+
             cost = float(len(path))
             if cost < best_cost:
                 best_cost = cost
@@ -551,17 +579,40 @@ class FrontierExplorer:
                     self.target[1] - agent_y,
                     self.target[0] - agent_x
                 )
-                heading_diff = target_heading - agent_yaw
-                while heading_diff > math.pi:
-                    heading_diff -= 2 * math.pi
-                while heading_diff < -math.pi:
-                    heading_diff += 2 * math.pi
+                # Use wrap_pi for stable signed shortest-angle error
+                def wrap_pi(a):
+                    return (a + math.pi) % (2 * math.pi) - math.pi
 
-                if abs(heading_diff) > math.pi / 2:
+                heading_diff = wrap_pi(target_heading - agent_yaw)
+                abs_err = abs(heading_diff)
+
+                # DEBUG: Understand rotation behavior
+                if abs_err > math.pi / 4:  # Log when > 45 deg
+                    print(f"  [ROT-DEBUG] agent=({agent_x:.2f},{agent_y:.2f}) yaw={math.degrees(agent_yaw):.1f}deg "
+                          f"target=({self.target[0]:.2f},{self.target[1]:.2f}) "
+                          f"target_heading={math.degrees(target_heading):.1f}deg "
+                          f"heading_diff={math.degrees(heading_diff):.1f}deg")
+
+                # Hysteresis to prevent oscillation at ±π discontinuity
+                behind = abs_err > math.pi / 2
+                almost_opposite = abs_err > math.radians(170)
+
+                if behind:
                     self._forward_clear_streak = 0
                     if debug:
                         print(f"  [FRONTIER] Target behind ({math.degrees(heading_diff):.1f}deg) -> rotating")
-                    return ROTATE_LEFT if heading_diff > 0 else ROTATE_RIGHT
+
+                    # When almost opposite (±170°+), maintain last direction to avoid chatter
+                    if almost_opposite and self._last_turn is not None:
+                        return self._last_turn
+
+                    # Choose direction based on shorter turn
+                    if heading_diff > 0:
+                        self._last_turn = ROTATE_LEFT
+                        return ROTATE_LEFT
+                    else:
+                        self._last_turn = ROTATE_RIGHT
+                        return ROTATE_RIGHT
 
         # Find new target if needed
         if self.target is None:
@@ -687,6 +738,8 @@ class FrontierExplorer:
 
         # If facing target, check if path looks clear before moving
         if abs(heading_error) < self.heading_tolerance:
+            # Reset hysteresis when aligned
+            self._last_turn = None
             # Check MULTIPLE points ahead for obstacles
             check_distances = [0.2, 0.4, 0.6]  # meters
             for check_dist in check_distances:
@@ -787,6 +840,7 @@ class FrontierExplorer:
         self._current_target_blocks = 0
         self._blocked_targets = []
         self._forward_clear_streak = 0
+        self._last_turn = None
 
 
 def test_clustering():
