@@ -582,9 +582,9 @@ class GLBSimulator:
             print(f"  [MOVE] ERROR: Backward action reached movement code!")
             return False
         elif action == 3:  # Turn left (CCW when viewed from above)
-            self.yaw -= self.turn_speed
+            self.yaw += self.turn_speed   # CCW increases yaw (standard math convention)
         elif action == 4:  # Turn right (CW when viewed from above)
-            self.yaw += self.turn_speed
+            self.yaw -= self.turn_speed   # CW decreases yaw (standard math convention)
         # Strafe actions (5, 6) are blocked at the start of move() and will never reach here
         elif action == 7:  # Look up
             self.pitch = min(self.pitch + self.turn_speed, math.radians(60))
