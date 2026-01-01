@@ -5,7 +5,10 @@
       "WebSearch",
       "WebFetch(domain:www.sciencedirect.com)",
       "Bash(nvidia-smi:*)",
-      "Bash(python test_full_pipeline.py:*)"
+      "Bash(python test_full_pipeline.py:*)",
+      "Bash(timeout 60 python:*)",
+      "Bash(timeout 120 python:*)",
+      "Bash(timeout 90 python:*)"
     ]
   }
 }

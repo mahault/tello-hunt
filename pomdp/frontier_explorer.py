@@ -349,12 +349,13 @@ class FrontierExplorer:
         grid: np.ndarray,
         start_cell: Tuple[int, int],
         goal_cell: Tuple[int, int],
-        free_threshold: int = 180,
+        obstacle_threshold: int = 50,  # Cells below this are definitely obstacles
     ) -> bool:
         """
-        SAFEGUARD 3: Check if goal is reachable via FREE space.
+        SAFEGUARD 3: Check if goal is reachable via traversable space.
 
-        Uses BFS flood-fill on free cells only.
+        Uses BFS flood-fill. Traversable = free OR unknown (not obstacle).
+        This allows planning through unexplored areas.
         """
         h, w = grid.shape
         sx, sy = start_cell
@@ -384,8 +385,9 @@ class FrontierExplorer:
                 nx, ny = x + dx, y + dy
                 if 0 <= nx < w and 0 <= ny < h:
                     if (nx, ny) not in visited:
-                        # Check if cell is free (traversable)
-                        if grid[ny, nx] > free_threshold:
+                        # Check if cell is traversable (not a definite obstacle)
+                        # Cells >= obstacle_threshold are traversable (free or unknown)
+                        if grid[ny, nx] >= obstacle_threshold:
                             visited.add((nx, ny))
                             queue.append((nx, ny))
 
@@ -666,6 +668,16 @@ class FrontierExplorer:
                     agent_yaw=agent_yaw, agent_world=agent_world, debug=debug
                 )
 
+                # DEBUG: If no best found, show why each cluster was rejected
+                if best is None and len(self.clusters) > 0:
+                    print(f"  [FRONTIER-DEBUG] No valid cluster found. Checking {len(self.clusters)} clusters:")
+                    for i, c in enumerate(self.clusters[:5]):  # Show first 5
+                        too_close = c.distance < self.min_frontier_distance
+                        reachable = self.is_reachable(grid, agent_cell, c.centroid_cell)
+                        blacklisted = self._is_blacklisted(c.centroid_cell)
+                        print(f"    Cluster {i}: dist={c.distance:.2f}m "
+                              f"close={too_close} reach={reachable} black={blacklisted}")
+
                 if best is None:
                     # FALLBACK: Pick nearest FORWARD frontier
                     result = self._select_nearest_frontier_cell(
@@ -680,9 +692,12 @@ class FrontierExplorer:
                         if debug:
                             print(f"  [FRONTIER] MID fallback: nearest frontier at ({self.target[0]:.2f}, {self.target[1]:.2f})")
                     else:
-                        # All frontiers unreachable or blacklisted - rotate to scan
-                        if debug:
-                            print(f"  [FRONTIER] All frontiers blocked/blacklisted - rotating to scan")
+                        # All frontiers unreachable or blacklisted - clear old blacklist and try again
+                        if len(self._blocked_targets) > 0:
+                            print(f"  [FRONTIER] All blocked ({len(self._blocked_targets)} blacklisted) - clearing oldest")
+                            # Clear oldest half of blacklist to allow recovery
+                            self._blocked_targets = self._blocked_targets[len(self._blocked_targets)//2:]
+                        # Rotate to scan
                         return ROTATE_LEFT if self._frame_count % 2 == 0 else ROTATE_RIGHT
                 else:
                     # PLAN A* PATH to the best cluster (MID phase behavior)
@@ -751,8 +766,11 @@ class FrontierExplorer:
                     0 <= check_cell[1] < grid.shape[0]):
                     cell_val = grid[check_cell[1], check_cell[0]]
                     if cell_val < 50:  # Only block on definite obstacles (value < 50)
-                        # Direction is blocked - blacklist this target and rotate
-                        print(f"  [FRONTIER] Path blocked at {check_dist:.1f}m (cell={cell_val}), blacklisting")
+                        # Direction is blocked by grid - DON'T re-mark (already an obstacle)
+                        # Just replan without marking to avoid feedback loop
+                        print(f"  [FRONTIER] Grid shows obstacle at {check_dist:.1f}m (cell={cell_val}) - replanning")
+
+                        # Blacklist the target to force replanning through a different route
                         if self.target_cell is not None:
                             expiry = self._frame_count + self._blacklist_duration
                             self._blocked_targets.append((self.target_cell, expiry))

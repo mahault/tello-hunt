@@ -231,6 +231,13 @@ class OccupancyMap:
 
         # Convert to int to avoid uint8 overflow before min/max
         current = int(self.grid[y, x])
+
+        # CRITICAL: Don't overwrite cells that have been explicitly marked as obstacles
+        # (high visit count + low value = locked obstacle from collision detection)
+        if current < 10 and self.visit_count[y, x] >= 5:
+            # This cell was explicitly blocked - don't update it
+            return
+
         self.visit_count[y, x] += 1
 
         if free:
@@ -260,21 +267,25 @@ class OccupancyMap:
             pose_yaw: Current heading in radians
             distance: Distance ahead to mark as obstacle
         """
-        # Calculate obstacle position ahead of drone
-        obs_x = pose_x + distance * np.cos(pose_yaw)
-        obs_y = pose_y + distance * np.sin(pose_yaw)
+        # Mark obstacles at multiple distances ahead (0.2m, 0.3m, 0.4m)
+        # This ensures we catch the actual obstacle location
+        for dist in [0.2, 0.3, 0.4]:
+            obs_x = pose_x + dist * np.cos(pose_yaw)
+            obs_y = pose_y + dist * np.sin(pose_yaw)
 
-        obs_cx, obs_cy = self.world_to_map(obs_x, obs_y)
+            obs_cx, obs_cy = self.world_to_map(obs_x, obs_y)
 
-        # Mark the obstacle cell and a few cells around it as occupied
-        for dx in range(-1, 2):
-            for dy in range(-1, 2):
-                cell_x = obs_cx + dx
-                cell_y = obs_cy + dy
-                if self.is_valid_cell(cell_x, cell_y):
-                    # Force to occupied (value 0)
-                    self.grid[cell_y, cell_x] = 0
-                    self.visit_count[cell_y, cell_x] += 5  # High confidence
+            # Mark a larger area (5x5) to ensure A* doesn't route through adjacent cells
+            for dx in range(-2, 3):
+                for dy in range(-2, 3):
+                    cell_x = obs_cx + dx
+                    cell_y = obs_cy + dy
+                    if self.is_valid_cell(cell_x, cell_y):
+                        # Force to occupied (value 0)
+                        self.grid[cell_y, cell_x] = 0
+                        self.visit_count[cell_y, cell_x] += 10  # Very high confidence
+
+        print(f"  [MAP] Marked obstacle ahead at ({pose_x:.2f},{pose_y:.2f}) yaw={np.degrees(pose_yaw):.0f}deg")
 
     def mark_place(self, place_id: int, x: float, y: float, label: str = None):
         """
