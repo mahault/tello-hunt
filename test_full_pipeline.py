@@ -140,6 +140,14 @@ def execute_action_heading_first(action: int, sim, frame=None, depth_map=None, c
         moved = sim.move(action, debug=debug)
         return moved, False
 
+    # Action 2 (BACKWARD) - execute directly for escape maneuvers
+    # Don't rotate 180°, just step back immediately
+    if action == 2:
+        if debug:
+            print(f"  [HEADING-FIRST] Executing backward directly (escape)")
+        moved = sim.move(2, debug=debug)
+        return moved, not moved
+
     # Get current yaw (in radians)
     current_yaw = sim.yaw if hasattr(sim, 'yaw') else 0.0
 
