@@ -578,14 +578,15 @@ class GLBSimulator:
                 self.z -= self.move_speed * math.cos(self.yaw)
         elif action == 2:  # Backward - for escape maneuvers
             # Check if backward is clear (simple bounds check, no ray check)
+            old_x, old_z = self.x, self.z
             new_x = self.x - self.move_speed * math.sin(self.yaw)
             new_z = self.z + self.move_speed * math.cos(self.yaw)
             if self._is_inside_bounds(new_x, new_z):
                 self.x = new_x
                 self.z = new_z
-                print(f"  [MOVE] Backward to ({self.x:.0f},{self.z:.0f})")
+                print(f"  [MOVE] Backward: ({old_x:.2f},{old_z:.2f}) -> ({self.x:.2f},{self.z:.2f}) yaw={math.degrees(self.yaw):.1f}")
             else:
-                print(f"  [MOVE] BLOCKED backward at ({self.x:.0f}, {self.z:.0f})")
+                print(f"  [MOVE] BLOCKED backward at ({self.x:.2f},{self.z:.2f}) yaw={math.degrees(self.yaw):.1f}")
                 moved = False
         elif action == 3:  # Turn left (CCW when viewed from above)
             self.yaw += self.turn_speed   # CCW increases yaw (standard math convention)

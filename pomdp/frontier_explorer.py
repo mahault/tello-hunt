@@ -771,7 +771,7 @@ class FrontierExplorer:
                     if cell_val < 50:  # Only block on definite obstacles (value < 50)
                         # Direction is blocked by grid - implement escape behavior
                         self._grid_block_streak += 1
-                        print(f"  [FRONTIER] Grid shows obstacle at {check_dist:.1f}m (cell={cell_val}) - streak={self._grid_block_streak}")
+                        print(f"  [FRONTIER] Grid obstacle at dist={check_dist:.1f}m cell={check_cell} val={cell_val} streak={self._grid_block_streak}")
 
                         # 1) Short-term (streak 1-6): alternate turns to scan for clear direction
                         if self._grid_block_streak <= 6:

@@ -1,0 +1,146 @@
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+Device set to use cuda:0
+======================================================================
+FULL PIPELINE TEST - Autonomous Exploration
+======================================================================
+
+World Models:
+  1 - CSCG: Clone-structured cognitive graph with ORB
+  2 - Semantic: EFE-based exploration with room/object priors
+  --topological: Pure place-graph exploration (camera-only)
+  --lookahead: Look-ahead exploration (heading evaluation before moving)
+  --frontier: Frontier-based exploration (canonical robotics approach)
+
+Controls:
+  SPACE   - Toggle autonomous/manual control
+  E       - Switch to Exploration mode
+  H       - Switch to Hunting mode
+  M       - Print map summary (semantic mode)
+  P       - Spawn a person in current room
+  R       - Reset everything
+  Q/ESC   - Quit
+
+In MANUAL mode: WASD or Arrow keys to move
+======================================================================
+
+Using GLB simulator (realistic textures for ORB)
+Loading model from C:\Users\mahau\OneDrive\Desktop\projects\tello-hunt\simulator\home_-_p3.glb...
+Setting up ray tracer for collision detection...
+  Combined 102 meshes for collision detection
+Model center: [    -194.71      37.957      116.58]
+Model extents: [     412.39      99.694      688.05]
+Loaded 102 meshes (skipped 3 non-mesh objects)
+Room layout configured:
+  Living Room: x=[-381, -195], z=[225, 441]
+  Kitchen: x=[-195, -9], z=[225, 441]
+  Hallway: x=[-381, -9], z=[9, 225]
+  Bedroom: x=[-381, -195], z=[-207, 9]
+  Bathroom: x=[-195, -9], z=[-207, 9]
+Vertical bounds: Y=[28, 63] (floor to ceiling)
+Starting position: (-101.6, 47.9, 332.6) in Kitchen
+Floor Y: -11.9, Ceiling Y: 87.8, Drone height: 47.9
+Model loaded successfully!
+Initializing CSCG World Model with ORB...
+Loading depth estimator (Depth Anything)...
+Loading depth estimator (depth_anything) on cuda...
+Depth Anything v2 loaded!
+Depth estimator ready!
+Collision avoidance (flow + depth) ready!
+Initializing Frontier Explorer (canonical robotics)...
+Ready! (Frontier (canonical robotics) exploration)
+
+Starting autonomous exploration...
+The drone will explore the house on its own.
+Press SPACE to take manual control.
+
+  [CAM-DEBUG] yaw=0deg motion_fwd=(0.00, -1.00) cam_fwd=(-0.00, -1.00)
+  [DEPTH] raw range: 0-313, max_depth=311, near=1.00
+  [YAW-CHECK] sim.yaw=0.0deg world_yaw=0.0deg pos=(-0.00,0.00)
+  [FRONTIER] Phase transition: EARLY -> MID (51 cells explored)
+  [FRONTIER] MID: 12 cells -> 1 clusters
+  [A*-DEBUG] agent_cell=(100, 100) goal=(104, 102) path_len=7
+  [A*-DEBUG] agent_cell=(100, 100) goal=(105, 102) path_len=8
+  [FRONTIER] MID: A* path 7 cells to cluster at (0.20, 0.00)
+  [FRONTIER] Peek 1/2 (clear) -> STAY
+  [FRONTIER] room=Kitchen, rooms_found=[], frontiers=1, target=(0.4, 0.1), mapped=0.3%
+  [A*-DEBUG] agent_cell=(101, 100) goal=(105, 102) path_len=7
+  [A*-DEBUG] agent_cell=(101, 100) goal=(106, 103) path_len=9
+  [A*-DEBUG] agent_cell=(101, 100) goal=(107, 103) path_len=10
+  [A*-DEBUG] agent_cell=(101, 100) goal=(108, 104) path_len=12
+  [A*-DEBUG] agent_cell=(101, 100) goal=(109, 104) path_len=13
+  [A*-DEBUG] agent_cell=(102, 100) goal=(115, 97) path_len=17
+  [A*-DEBUG] agent_cell=(102, 100) goal=(116, 97) path_len=18
+  [A*-DEBUG] agent_cell=(102, 100) goal=(117, 97) path_len=19
+  [ROT-DEBUG] agent=(0.29,0.05) yaw=10.0deg target=(0.50,-0.20) target_heading=-50.2deg heading_diff=-60.2deg
+  [ROT-DEBUG] agent=(0.29,0.05) yaw=0.0deg target=(0.50,-0.20) target_heading=-50.2deg heading_diff=-50.2deg
+  [FRONTIER] Grid obstacle at dist=0.6m cell=(107, 97) val=7 streak=1
+  [A*-DEBUG] agent_cell=(103, 100) goal=(116, 91) path_len=23
+  [A*-DEBUG] agent_cell=(103, 100) goal=(117, 92) path_len=23
+  [A*-DEBUG] agent_cell=(103, 100) goal=(118, 92) path_len=24
+  [A*-DEBUG] agent_cell=(103, 100) goal=(119, 92) path_len=25
+  [A*-DEBUG] agent_cell=(103, 100) goal=(120, 91) path_len=27
+  [YAW-CHECK] sim.yaw=290.0deg world_yaw=290.0deg pos=(0.39,-0.06)
+  [A*-DEBUG] agent_cell=(104, 98) goal=(104, 86) path_len=13
+  [A*-DEBUG] agent_cell=(104, 98) goal=(104, 87) path_len=12
+  [A*-DEBUG] agent_cell=(104, 98) goal=(104, 88) path_len=11
+  [A*-DEBUG] agent_cell=(104, 94) goal=(108, 85) path_len=14
+  [A*-DEBUG] agent_cell=(104, 94) goal=(108, 86) path_len=13
+  [A*-DEBUG] agent_cell=(104, 94) goal=(107, 87) path_len=11
+  [A*-DEBUG] agent_cell=(104, 94) goal=(107, 88) path_len=10
+  [A*-DEBUG] agent_cell=(104, 94) goal=(108, 89) path_len=10
+  [COLLISION] risk=0.00 (NONE), flow=0.00, depth=0.00, ttc=35.5s
+  [HEADING-FIRST] Aligned, moving forward
+  [GLB] Moved forward to (-182,48,284) yaw=270° room=Kitchen
+  [MOVE] Room: Kitchen -> Living Room
+  [A*-DEBUG] agent_cell=(104, 91) goal=(109, 80) path_len=17
+  [A*-DEBUG] agent_cell=(104, 91) goal=(109, 81) path_len=16
+  [A*-DEBUG] agent_cell=(104, 91) goal=(108, 82) path_len=14
+  [A*-DEBUG] agent_cell=(104, 91) goal=(110, 82) path_len=16
+  [A*-DEBUG] agent_cell=(104, 88) goal=(109, 82) path_len=12
+  [A*-DEBUG] agent_cell=(104, 88) goal=(108, 83) path_len=10
+  [A*-DEBUG] agent_cell=(104, 88) goal=(110, 83) path_len=12
+  [A*-DEBUG] agent_cell=(104, 88) goal=(111, 82) path_len=14
+  [YAW-CHECK] sim.yaw=270.0deg world_yaw=270.0deg pos=(0.49,-1.40)
+  [A*-DEBUG] agent_cell=(104, 85) goal=(109, 82) path_len=9
+  [A*-DEBUG] agent_cell=(104, 85) goal=(108, 83) path_len=7
+  [A*-DEBUG] agent_cell=(104, 85) goal=(110, 83) path_len=9
+  [A*-DEBUG] agent_cell=(104, 85) goal=(111, 82) path_len=11
+  [A*-DEBUG] agent_cell=(104, 85) goal=(109, 82) path_len=9
+  [A*-DEBUG] agent_cell=(104, 85) goal=(108, 83) path_len=7
+  [A*-DEBUG] agent_cell=(104, 85) goal=(110, 83) path_len=9
+  [A*-DEBUG] agent_cell=(104, 85) goal=(111, 82) path_len=11
+  [CAM-DEBUG] yaw=290deg motion_fwd=(-0.94, -0.34) cam_fwd=(-0.94, -0.34)
+  [A*-DEBUG] agent_cell=(104, 85) goal=(109, 82) path_len=9
+  [A*-DEBUG] agent_cell=(104, 85) goal=(108, 83) path_len=7
+  [A*-DEBUG] agent_cell=(104, 85) goal=(110, 83) path_len=9
+  [A*-DEBUG] agent_cell=(104, 85) goal=(111, 82) path_len=11
+  [A*-DEBUG] agent_cell=(104, 85) goal=(109, 82) path_len=9
+  [A*-DEBUG] agent_cell=(104, 85) goal=(108, 83) path_len=7
+  [A*-DEBUG] agent_cell=(104, 85) goal=(110, 83) path_len=9
+  [A*-DEBUG] agent_cell=(104, 85) goal=(109, 81) path_len=10
+  [A*-DEBUG] agent_cell=(104, 85) goal=(110, 82) path_len=10
+  [A*-DEBUG] agent_cell=(104, 85) goal=(111, 81) path_len=12
+  [A*-DEBUG] agent_cell=(105, 84) goal=(112, 79) path_len=13
+  [A*-DEBUG] agent_cell=(105, 84) goal=(113, 80) path_len=13
+  [A*-DEBUG] agent_cell=(105, 84) goal=(113, 81) path_len=12
+  [A*-DEBUG] agent_cell=(105, 84) goal=(114, 79) path_len=15
+  [A*-DEBUG] agent_cell=(105, 84) goal=(115, 79) path_len=16
+  [ROT-DEBUG] agent=(0.54,-1.69) yaw=300.0deg target=(0.90,-1.70) target_heading=-1.4deg heading_diff=58.6deg
+  [ROT-DEBUG] agent=(0.54,-1.69) yaw=310.0deg target=(0.90,-1.70) target_heading=-1.4deg heading_diff=48.6deg
+  [A*-DEBUG] agent_cell=(106, 83) goal=(110, 82) path_len=6
+  [A*-DEBUG] agent_cell=(106, 83) goal=(111, 83) path_len=8
+  [A*-DEBUG] agent_cell=(106, 83) goal=(110, 84) path_len=8
+  [MOVE] BLOCKED forward at (-276, 264) yaw=340
+  [POSE-DEBUG] GLB world=(0.68, -1.74, 340deg) odometry=(0.68, -1.74, -20deg)
+  [MAP] Marked obstacle ahead at (0.68,-1.74) yaw=340deg
+  [FRONTIER] Block #1 for target (1.0, -1.8)
+  [FRONTIER] Blacklisting target (1.0, -1.8) after block
+  [A*-DEBUG] agent_cell=(106, 83) goal=(106, 70) path_len=20
+  [A*-DEBUG] agent_cell=(106, 83) goal=(107, 70) path_len=17
+  [A*-DEBUG] agent_cell=(106, 83) goal=(108, 70) path_len=18
+  [CSCG-ORB] place=Place_0(id=0), conf=0.567, n_places=3, new=False
+  [ROT-DEBUG] agent=(0.68,-1.74) yaw=330.0deg target=(0.50,-2.10) target_heading=-117.1deg heading_diff=-87.1deg
+[  60] Place_0      | Places=3 Clones=24 State=frontier VFE=0.00
+  [YAW-CHECK] sim.yaw=320.0deg world_yaw=320.0deg pos=(0.68,-1.74)
+  [ROT-DEBUG] agent=(0.68,-1.74) yaw=320.0deg target=(0.50,-2.10) target_heading=-117.1deg heading_diff=-77.1deg
+  [GLB] Moved turn_right to (-276,48,264) yaw=310° room=Living Room

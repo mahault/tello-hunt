@@ -691,7 +691,8 @@ class FullPipelineSimulator:
         collision_state = None
         debug_this_frame = (self._frame_count % 30 == 0)
 
-        if self.collision_avoidance is not None and action in (1, 2):
+        # BACKWARD (action 2) bypasses collision avoidance - it's used for escape when facing obstacle
+        if self.collision_avoidance is not None and action == 1:  # Only check FORWARD
             # Assess collision risk using flow + depth
             collision_state = self.collision_avoidance.assess_risk(
                 frame, depth_map, debug=debug_this_frame
@@ -709,7 +710,7 @@ class FullPipelineSimulator:
                           f"(risk={collision_state.combined_risk:.2f}, ttc={collision_state.ttc_estimate:.1f}s)")
                 action = safe_action
 
-        elif depth_distances is not None and action in (1, 2):
+        elif depth_distances is not None and action == 1:  # Only check FORWARD
             # Fallback to depth-only blocking if collision avoidance not available
             path_clear, path_distance = self.depth_estimator.is_path_clear(
                 depth_map, direction='forward', threshold=0.25
