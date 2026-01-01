@@ -96,8 +96,13 @@ class FrontierExplorer:
         # Grid-block escape state (prevents endless replanning when stuck)
         self._grid_block_streak = 0
 
-        # Forward cooldown after escape (prevents BACKWARD→FORWARD undo loop)
-        self._no_forward_until_frame = 0
+        # Hybrid escape mode (replaces BACKWARD strategy)
+        # When stuck, pipeline scans 360° to find clear direction, sets escape_target_yaw
+        self._escape_mode = False
+        self._escape_target_yaw: Optional[float] = None
+        self._escape_steps_remaining = 0
+        self._escape_until_frame = 0
+        self._needs_escape_scan = False  # Flag for pipeline to trigger 360° scan
 
     # ---------------------------
     # A* PATH PLANNING HELPERS
@@ -258,6 +263,34 @@ class FrontierExplorer:
         # Trim old entries
         if len(self._blocked_targets) > self._max_blacklisted:
             self._blocked_targets = self._blocked_targets[-self._max_blacklisted:]
+
+    # ---------------------------
+    # ESCAPE MODE API
+    # ---------------------------
+    @property
+    def needs_escape_scan(self) -> bool:
+        """Returns True when pipeline should scan 360° to find escape direction."""
+        return self._needs_escape_scan
+
+    def set_escape_direction(self, target_yaw: float):
+        """
+        Called by pipeline after 360° scan finds a clear direction.
+        Activates escape mode to rotate toward target_yaw and move forward.
+        """
+        self._escape_mode = True
+        self._escape_target_yaw = target_yaw
+        self._escape_steps_remaining = 5  # Move forward 5 times after aligning
+        self._escape_until_frame = self._frame_count + 30  # Timeout
+        self._needs_escape_scan = False
+        self._grid_block_streak = 0
+        print(f"  [ESCAPE] Escape direction set: yaw={math.degrees(target_yaw):.1f}deg")
+
+    def cancel_escape(self):
+        """Called if no escape direction found (all blocked)."""
+        self._escape_mode = False
+        self._escape_target_yaw = None
+        self._needs_escape_scan = False
+        # Keep grid_block_streak high so we try again soon
 
     def extract_frontiers(
         self,
@@ -543,6 +576,38 @@ class FrontierExplorer:
         agent_cell = world_to_map_fn(agent_x, agent_y)
         agent_world = (agent_x, agent_y)
 
+        # === ESCAPE MODE HANDLING ===
+        # If in escape mode, prioritize escape actions over normal exploration
+        if self._escape_mode and self._escape_target_yaw is not None:
+            # Check timeout
+            if self._frame_count > self._escape_until_frame:
+                print(f"  [ESCAPE] Timeout - exiting escape mode")
+                self._escape_mode = False
+                self._escape_target_yaw = None
+            else:
+                # Rotate toward escape target yaw
+                heading_error = self._escape_target_yaw - agent_yaw
+                while heading_error > math.pi:
+                    heading_error -= 2 * math.pi
+                while heading_error < -math.pi:
+                    heading_error += 2 * math.pi
+
+                if abs(heading_error) > 0.25:  # ~15 deg tolerance
+                    if debug:
+                        print(f"  [ESCAPE] Rotating toward escape heading (error={math.degrees(heading_error):.1f}deg)")
+                    return ROTATE_LEFT if heading_error > 0 else ROTATE_RIGHT
+
+                # Aligned - move forward
+                self._escape_steps_remaining -= 1
+                if self._escape_steps_remaining <= 0:
+                    print(f"  [ESCAPE] Escape complete - resuming normal exploration")
+                    self._escape_mode = False
+                    self._escape_target_yaw = None
+                else:
+                    if debug:
+                        print(f"  [ESCAPE] Moving forward ({self._escape_steps_remaining} steps remaining)")
+                return FORWARD
+
         # Count explored cells to determine phase
         free_threshold = 180
         explored_cells = np.sum(grid > free_threshold)
@@ -776,20 +841,22 @@ class FrontierExplorer:
                         self._grid_block_streak += 1
                         print(f"  [FRONTIER] Grid obstacle at dist={check_dist:.1f}m cell={check_cell} val={cell_val} streak={self._grid_block_streak}")
 
-                        # 1) Short-term (streak 1-6): alternate turns to scan for clear direction
-                        if self._grid_block_streak <= 6:
+                        # 1) Short-term (streak 1-4): alternate turns to scan for clear direction
+                        if self._grid_block_streak <= 4:
                             self._forward_clear_streak = 0
                             return ROTATE_LEFT if (self._grid_block_streak % 2 == 0) else ROTATE_RIGHT
 
-                        # 2) Medium-term (streak 7): back up to unstick
-                        if self._grid_block_streak == 7:
-                            print(f"  [FRONTIER] Backing up to escape corner")
+                        # 2) Medium-term (streak 5-9): trigger escape scan
+                        # Pipeline will scan 360° using actual sim.move() to find clear direction
+                        if self._grid_block_streak <= 9:
+                            if not self._needs_escape_scan:
+                                print(f"  [FRONTIER] Requesting escape scan (streak={self._grid_block_streak})")
+                                self._needs_escape_scan = True
                             self._forward_clear_streak = 0
-                            # Set cooldown to prevent immediate FORWARD after backing up
-                            self._no_forward_until_frame = self._frame_count + 15
-                            return BACKWARD
+                            # Return STAY to give pipeline time to do the scan
+                            return STAY
 
-                        # 3) Long-term (streak 8+): clear target and force new plan
+                        # 3) Long-term (streak 10+): clear target and force new plan
                         print(f"  [FRONTIER] Clearing target after escape attempts")
                         if self.target_cell is not None:
                             expiry = self._frame_count + self._blacklist_duration
@@ -809,12 +876,6 @@ class FrontierExplorer:
                 if debug:
                     print(f"  [FRONTIER] Peek {self._forward_clear_streak}/{self._forward_clear_required} (clear) -> STAY")
                 return STAY
-            # Path is clear - but check for escape cooldown first
-            if self._frame_count < self._no_forward_until_frame:
-                # Still in cooldown after escape - rotate to find new heading
-                if debug:
-                    print(f"  [FRONTIER] Forward blocked by escape cooldown ({self._no_forward_until_frame - self._frame_count} frames)")
-                return ROTATE_LEFT if (self._frame_count % 2 == 0) else ROTATE_RIGHT
 
             # Path is clear - reset escape state and move forward
             self._forward_clear_streak = 0
@@ -888,6 +949,12 @@ class FrontierExplorer:
         self._forward_clear_streak = 0
         self._last_turn = None
         self._grid_block_streak = 0
+        # Escape mode reset
+        self._escape_mode = False
+        self._escape_target_yaw = None
+        self._escape_steps_remaining = 0
+        self._escape_until_frame = 0
+        self._needs_escape_scan = False
 
 
 def test_clustering():

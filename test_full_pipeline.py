@@ -854,6 +854,53 @@ class FullPipelineSimulator:
 
         return result
 
+    def _scan_for_escape_direction(self) -> tuple:
+        """
+        Scan 360 degrees using actual sim.move() to find best escape direction.
+        Returns (best_yaw, best_distance).
+        """
+        import math
+
+        original_x = self.sim.x
+        original_z = self.sim.z
+        original_yaw = self.sim.yaw
+
+        best_yaw = original_yaw
+        best_dist = 0.0
+
+        print(f"  [ESCAPE-SCAN] Starting 360° scan from ({original_x:.1f}, {original_z:.1f})")
+
+        # Try 16 directions (22.5 degree increments)
+        for angle_idx in range(16):
+            test_yaw = angle_idx * (2 * math.pi / 16)
+
+            # Set yaw and try forward
+            self.sim.yaw = test_yaw
+            test_x, test_z = self.sim.x, self.sim.z
+
+            # Try moving forward
+            self.sim.move(1, debug=False)  # FORWARD = 1
+
+            # Measure how far we moved
+            dist = math.sqrt((self.sim.x - test_x)**2 + (self.sim.z - test_z)**2)
+
+            if dist > best_dist:
+                best_dist = dist
+                best_yaw = test_yaw
+                print(f"  [ESCAPE-SCAN] New best: yaw={math.degrees(test_yaw):.0f}° dist={dist:.1f}")
+
+            # Restore position for next test
+            self.sim.x = original_x
+            self.sim.z = original_z
+
+        # Restore original state
+        self.sim.x = original_x
+        self.sim.z = original_z
+        self.sim.yaw = original_yaw
+
+        print(f"  [ESCAPE-SCAN] Best direction: yaw={math.degrees(best_yaw):.0f}° dist={best_dist:.1f}")
+        return best_yaw, best_dist
+
     def _exploration_update(self, obs: ObservationToken, loc_result, depth_map=None) -> Dict:
         """Run exploration mode update."""
         # Get place ID for topological mode
@@ -930,6 +977,16 @@ class FullPipelineSimulator:
                 map_to_world_fn=self.spatial_mapper.map.map_to_world,
                 debug=debug_this_frame,
             )
+
+            # === ESCAPE SCAN HANDLING ===
+            # If frontier explorer needs escape scan, do 360° scan using actual sim.move()
+            if self.frontier_explorer.needs_escape_scan and self.use_glb:
+                best_yaw, best_dist = self._scan_for_escape_direction()
+                if best_dist > 5.0:  # Found a direction with at least 5 sim units clearance
+                    self.frontier_explorer.set_escape_direction(best_yaw)
+                else:
+                    print(f"  [ESCAPE-SCAN] No clear direction found (best dist={best_dist:.1f})")
+                    self.frontier_explorer.cancel_escape()
 
             # Check if exploration is complete
             if self.frontier_explorer.exploration_complete:
