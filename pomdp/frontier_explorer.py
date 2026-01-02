@@ -31,6 +31,83 @@ class FrontierCluster:
     centroid_world: Tuple[float, float]  # Centroid in world coords
     size: int  # Number of cells
     distance: float  # Distance from agent to centroid
+    is_doorway: bool = False  # Whether cluster appears to be a doorway
+
+
+@dataclass
+class RoomTransition:
+    """A room-to-room transition event."""
+    from_room: str
+    to_room: str
+    frame: int
+    position: Tuple[float, float]
+
+
+class RoomTransitionTracker:
+    """
+    Tracks room-to-room transitions as first-class events.
+
+    Door crossings are counted when the drone moves between rooms,
+    providing a metric for exploration progress.
+    """
+
+    def __init__(self):
+        self.current_room: str = "Unknown"
+        self.transition_count: int = 0
+        self.transitions: List[RoomTransition] = []
+        self.rooms_visited: Set[str] = set()
+        self._unique_doorways: Set[Tuple[str, str]] = set()
+
+    def update(self, new_room: str, frame: int, position: Tuple[float, float]) -> Optional[RoomTransition]:
+        """
+        Update room state, record transition if changed.
+
+        Returns the RoomTransition if one occurred, None otherwise.
+        """
+        if new_room == "Unknown":
+            return None
+
+        if new_room != self.current_room:
+            transition = None
+            if self.current_room != "Unknown":
+                transition = RoomTransition(
+                    from_room=self.current_room,
+                    to_room=new_room,
+                    frame=frame,
+                    position=position
+                )
+                self.transitions.append(transition)
+                self.transition_count += 1
+
+                # Track unique doorways (bidirectional)
+                pair = tuple(sorted([self.current_room, new_room]))
+                self._unique_doorways.add(pair)
+
+                print(f"  [DOOR-CROSSING] {self.current_room} -> {new_room} (frame {frame})")
+
+            self.current_room = new_room
+            self.rooms_visited.add(new_room)
+            return transition
+
+        return None
+
+    def get_stats(self) -> Dict:
+        """Get transition statistics."""
+        return {
+            "total_transitions": self.transition_count,
+            "rooms_visited": len(self.rooms_visited),
+            "unique_doorways": len(self._unique_doorways),
+            "room_list": list(self.rooms_visited),
+            "recent_transitions": [(t.from_room, t.to_room, t.frame) for t in self.transitions[-5:]],
+        }
+
+    def reset(self):
+        """Reset tracker state."""
+        self.current_room = "Unknown"
+        self.transition_count = 0
+        self.transitions = []
+        self.rooms_visited = set()
+        self._unique_doorways = set()
 
 
 # Action indices matching the simulator
@@ -58,12 +135,19 @@ class FrontierExplorer:
         heading_tolerance: float = 0.35,       # ~20 deg - when to move forward
         min_cluster_size: int = 3,             # Ignore tiny clusters (noise)
         bootstrap_cells: int = 50,             # Cells needed before applying filters
+        doorway_bonus: float = 0.4,            # Distance bonus for doorway clusters (m)
+        doorway_aspect_min: float = 1.5,       # Min aspect ratio to detect doorway
     ):
         self.min_frontier_distance = min_frontier_distance
         self.reached_threshold = reached_threshold
         self.heading_tolerance = heading_tolerance
         self.min_cluster_size = min_cluster_size
         self.bootstrap_cells = bootstrap_cells
+        self.doorway_bonus = doorway_bonus
+        self.doorway_aspect_min = doorway_aspect_min
+
+        # Room transition tracking
+        self.room_tracker = RoomTransitionTracker()
 
         # Current target
         self.target: Optional[Tuple[float, float]] = None
@@ -392,6 +476,27 @@ class FrontierExplorer:
 
         return frontiers
 
+    def _is_doorway_cluster(self, cells: List[Tuple[int, int]]) -> bool:
+        """
+        Heuristic to detect if a cluster is a doorway.
+
+        Doorway characteristics:
+        1. Elongated shape (aspect ratio > threshold)
+        2. Small-medium size (5-25 cells)
+        """
+        if len(cells) < 5 or len(cells) > 25:
+            return False
+
+        # Compute bounding box
+        xs = [c[0] for c in cells]
+        ys = [c[1] for c in cells]
+        width = max(xs) - min(xs) + 1
+        height = max(ys) - min(ys) + 1
+
+        # Check aspect ratio
+        aspect = max(width, height) / max(1, min(width, height))
+        return aspect >= self.doorway_aspect_min
+
     def cluster_frontiers(
         self,
         frontiers: List[Tuple[int, int]],
@@ -444,12 +549,16 @@ class FrontierExplorer:
             wx, wy = map_to_world_fn(cx, cy)
             dist = math.sqrt((wx - agent_world[0])**2 + (wy - agent_world[1])**2)
 
+            # Detect if this cluster looks like a doorway
+            is_doorway = self._is_doorway_cluster(cluster_cells)
+
             clusters.append(FrontierCluster(
                 cells=cluster_cells,
                 centroid_cell=(cx, cy),
                 centroid_world=(wx, wy),
                 size=len(cluster_cells),
                 distance=dist,
+                is_doorway=is_doorway,
             ))
 
         return clusters
@@ -543,6 +652,13 @@ class FrontierExplorer:
 
             # Compute effective distance (add small penalty for rotation needed)
             effective_dist = cluster.distance
+
+            # Apply doorway bonus - prioritize room transitions
+            if cluster.is_doorway:
+                effective_dist -= self.doorway_bonus
+                if debug:
+                    print(f"  [FRONTIER] Doorway bonus applied to cluster at {cluster.centroid_world}")
+
             if agent_yaw is not None and agent_world is not None:
                 target_heading = math.atan2(
                     cluster.centroid_world[1] - agent_world[1],
@@ -911,14 +1027,16 @@ class FrontierExplorer:
                         # Record blocked edge so A* will try different approach next time
                         self.record_blocked_edge(agent_cell, check_cell)
 
-                        # 1) Short-term (streak 1-4): alternate turns to scan for clear direction
-                        if self._grid_block_streak <= 4:
+                        # 1) Short-term (streak 1-5): alternate turns to scan for clear direction
+                        # Increased from 4 to give more time for simple turning to work
+                        if self._grid_block_streak <= 5:
                             self._forward_clear_streak = 0
                             return ROTATE_LEFT if (self._grid_block_streak % 2 == 0) else ROTATE_RIGHT
 
-                        # 2) Medium-term (streak 5-9): trigger escape scan
+                        # 2) Medium-term (streak 6-11): trigger escape scan
                         # Pipeline will scan 360° using actual sim.move() to find clear direction
-                        if self._grid_block_streak <= 9:
+                        # Increased from 5-9 to reduce expensive scan frequency
+                        if self._grid_block_streak <= 11:
                             if not self._needs_escape_scan:
                                 print(f"  [FRONTIER] Requesting escape scan (streak={self._grid_block_streak})")
                                 self._needs_escape_scan = True
@@ -1027,6 +1145,121 @@ class FrontierExplorer:
         self._needs_escape_scan = False
         # Blocked edge memory reset
         self._blocked_edges = {}
+        # Room tracking reset
+        self.room_tracker.reset()
+
+    # ---------------------------
+    # ROOM TRANSITION TRACKING
+    # ---------------------------
+    def report_room(self, room_name: str, position: Tuple[float, float]) -> Optional[RoomTransition]:
+        """
+        Report current room to track transitions.
+
+        Call this each frame with the current room name from simulator.
+        Returns a RoomTransition if a door crossing occurred.
+        """
+        return self.room_tracker.update(room_name, self._frame_count, position)
+
+    def get_room_stats(self) -> Dict:
+        """Get room transition statistics."""
+        return self.room_tracker.get_stats()
+
+    # ---------------------------
+    # CENTER-OF-GAP BIAS
+    # ---------------------------
+    def find_gap_center(
+        self,
+        grid: np.ndarray,
+        position: Tuple[int, int],
+        direction: float,
+        world_to_map_fn,
+        scan_width_m: float = 1.0,
+        fwd_dist_m: float = 0.5,
+    ) -> Tuple[Optional[float], float]:
+        """
+        Scan perpendicular to direction and find center of the gap.
+
+        Use this when approaching a narrow doorway to steer toward center.
+
+        Args:
+            grid: Occupancy grid
+            position: Current position (grid coords)
+            direction: Current heading (radians)
+            world_to_map_fn: Coordinate transform function
+            scan_width_m: Width of scan band (meters)
+            fwd_dist_m: Distance ahead to scan (meters)
+
+        Returns:
+            (lateral_offset_m, gap_width_m) or (None, 0) if no clear gap
+        """
+        n_samples = 11
+        half_width = scan_width_m / 2
+
+        px, py = position
+        fwd_x = math.cos(direction)
+        fwd_y = math.sin(direction)
+        right_x = math.cos(direction - math.pi/2)
+        right_y = math.sin(direction - math.pi/2)
+
+        # Assume 0.1m per cell
+        resolution = 0.1
+        fwd_cells = int(fwd_dist_m / resolution)
+
+        clear_indices = []
+        for i in range(n_samples):
+            lateral_m = -half_width + (i / (n_samples - 1)) * scan_width_m
+            lateral_cells = int(lateral_m / resolution)
+
+            sx = int(px + fwd_cells * fwd_x + lateral_cells * right_x)
+            sy = int(py + fwd_cells * fwd_y + lateral_cells * right_y)
+
+            if 0 <= sx < grid.shape[1] and 0 <= sy < grid.shape[0]:
+                val = grid[sy, sx]
+                if val >= 100:  # Free or lightly explored
+                    clear_indices.append(i)
+
+        if not clear_indices:
+            return None, 0.0
+
+        center_idx = sum(clear_indices) / len(clear_indices)
+        center_offset = -half_width + (center_idx / (n_samples - 1)) * scan_width_m
+        gap_width = len(clear_indices) * (scan_width_m / n_samples)
+
+        return center_offset, gap_width
+
+    def get_gap_steering_correction(
+        self,
+        grid: np.ndarray,
+        agent_cell: Tuple[int, int],
+        agent_yaw: float,
+        world_to_map_fn,
+        gap_narrow_threshold: float = 0.6,
+        gap_offset_min: float = 0.1,
+        bias_strength: float = 0.2,
+    ) -> float:
+        """
+        Get heading correction to steer toward gap center.
+
+        Only applies when approaching a narrow doorway.
+
+        Returns:
+            Heading correction in radians (add to current yaw)
+        """
+        offset, width = self.find_gap_center(grid, agent_cell, agent_yaw, world_to_map_fn)
+
+        if offset is None:
+            return 0.0
+
+        if width >= gap_narrow_threshold:
+            return 0.0  # Wide enough, no correction
+
+        if abs(offset) < gap_offset_min:
+            return 0.0  # Already centered
+
+        # Steer toward center
+        correction = -offset * bias_strength * 2
+        max_correction = 0.15  # ~8 degrees max
+        return max(-max_correction, min(max_correction, correction))
 
 
 def test_clustering():

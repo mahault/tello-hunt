@@ -210,10 +210,20 @@ This prevents doorways from being "painted over" by depth sensing at angles.
 
 ### Escape Strategies
 
-When stuck (5+ consecutive blocks):
-1. **Short-term (1-4 blocks)**: Alternate left/right turns
-2. **Medium-term (5-9 blocks)**: 360° scan for clear direction
-3. **Long-term (10+ blocks)**: Blacklist target, select new goal
+When stuck (6+ consecutive blocks):
+1. **Short-term (1-5 blocks)**: Alternate left/right turns
+2. **Medium-term (6-11 blocks)**: 360° scan for clear direction
+3. **Long-term (12+ blocks)**: Blacklist target, select new goal
+
+### Room Transition Tracking
+
+The frontier explorer tracks room-to-room transitions as first-class events:
+- Door crossings counted with timestamps
+- Unique doorways used tracked
+- Room visit history maintained
+
+Doorway detection uses aspect ratio heuristics (elongated frontier clusters).
+Doorway frontiers receive a 0.4m distance bonus for prioritization.
 
 ## Safety
 

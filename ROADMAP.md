@@ -1156,6 +1156,39 @@ if action == 1:  # FORWARD
         self._needs_escape_scan = True
 ```
 
+### Issue 11: Frontier Explorer Tuning ✓ FIXED (Jan 2026)
+**Files:** `pomdp/frontier_explorer.py`
+
+**Problem:** Default escape thresholds and frontier scoring needed tuning for better room exploration.
+
+**Changes:**
+
+1. **Escape frequency reduced:**
+   - Short-term turns: 1-5 (was 1-4)
+   - Medium-term scan: 6-11 (was 5-9)
+   - Long-term clear: 12+ (was 10+)
+
+2. **Doorway detection and bonus:**
+   - `_is_doorway_cluster()` detects elongated frontiers (aspect ratio > 1.5)
+   - 0.4m distance bonus for doorway clusters in scoring
+   - Prioritizes room transitions over open space exploration
+
+3. **Room transition tracking:**
+   - `RoomTransitionTracker` class tracks door crossings as first-class events
+   - `report_room(room_name, position)` API for pipeline integration
+   - Stats: total transitions, rooms visited, unique doorways used
+
+4. **Center-of-gap bias:**
+   - `find_gap_center()` scans perpendicular to heading
+   - `get_gap_steering_correction()` returns heading adjustment (max ±8°)
+   - Only applies for narrow gaps (< 0.6m width)
+
+**Test Results (150 frames):**
+- 2 rooms visited (Kitchen, Living Room)
+- 2 door crossings
+- 17.7% doorway cluster detection rate
+- All recovery mechanisms working
+
 ### Issue 10: Oscillation after escape ✓ FIXED (Jan 2026)
 **File:** `pomdp/frontier_explorer.py`
 
@@ -1270,6 +1303,268 @@ else:
 - **Optical Flow** catches "approaching a surface" even if depth fails (glossy walls)
 - **Monocular Depth** catches "static near obstacles" even if flow is low
 - Combined = much more robust than either alone
+
+---
+
+## Phase 15: End-to-End Hunting Pipeline (FIRM PLAN)
+
+### Current State (Jan 2026)
+
+**Working:**
+- Frontier-based exploration with A* pathfinding
+- Two-tier occupancy mapping (depth vs collision)
+- Room transition tracking and door crossing events
+- Escape strategies with blocked-edge memory
+- GLB simulator with realistic 3D house model
+
+**Partially Working:**
+- CSCG place recognition (ORB-based)
+- Semantic room classification (YOLO object inference)
+- Human search POMDP (belief tracking)
+- Interaction mode POMDP (action selection)
+
+**Not Yet Integrated:**
+- Exploration → Hunting mode switch
+- Person/cat detection triggering hunt
+- Approach and interaction behaviors
+- Return-to-patrol after interaction
+
+### Target: Autonomous Person/Cat Hunting
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TELLO HUNT PIPELINE                          │
+├─────────────────────────────────────────────────────────────────┤
+│  PHASE 1: EXPLORATION                                           │
+│  ├─ Frontier explorer builds occupancy map                      │
+│  ├─ Room transitions tracked (door crossings)                   │
+│  └─ Continue until: target detected OR coverage threshold       │
+├─────────────────────────────────────────────────────────────────┤
+│  PHASE 2: TARGET ACQUISITION                                    │
+│  ├─ YOLO detects person/cat in frame                           │
+│  ├─ Human search POMDP updates belief: "target at location X"  │
+│  └─ Trigger: switch to HUNTING mode                            │
+├─────────────────────────────────────────────────────────────────┤
+│  PHASE 3: APPROACH                                              │
+│  ├─ Interaction POMDP selects: APPROACH action                 │
+│  ├─ Visual servoing: center target in frame                    │
+│  ├─ Distance control: approach to ~2m                          │
+│  └─ Collision avoidance active throughout                      │
+├─────────────────────────────────────────────────────────────────┤
+│  PHASE 4: INTERACTION                                           │
+│  ├─ At target distance: switch to INTERACT state               │
+│  ├─ Execute interaction: wiggle, LED pattern, hover            │
+│  ├─ Monitor target response (movement, attention)              │
+│  └─ Backoff if target leaves or gets too close                 │
+├─────────────────────────────────────────────────────────────────┤
+│  PHASE 5: RETURN TO PATROL                                      │
+│  ├─ After interaction timeout OR target lost                   │
+│  ├─ Resume exploration from current position                   │
+│  └─ Update human belief: decay confidence at last location     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Implementation Steps
+
+#### Step 1: Mode Switching Logic (Priority: HIGH)
+
+**File:** `test_full_pipeline.py` (modify existing)
+
+Add mode switching based on YOLO detection:
+
+```python
+class PipelineController:
+    def __init__(self):
+        self.mode = "EXPLORATION"  # or "HUNTING"
+        self.target_class = "person"  # or "cat"
+        self.target_lost_frames = 0
+        self.interaction_timer = 0
+
+    def update(self, frame, yolo_results):
+        # Check for target
+        target_detected = self._detect_target(yolo_results)
+
+        if self.mode == "EXPLORATION":
+            if target_detected:
+                self.mode = "HUNTING"
+                print(f"[MODE] EXPLORATION -> HUNTING ({self.target_class} detected)")
+            else:
+                return self.frontier_explorer.choose_action(...)
+
+        elif self.mode == "HUNTING":
+            if not target_detected:
+                self.target_lost_frames += 1
+                if self.target_lost_frames > 30:  # ~1 second
+                    self.mode = "EXPLORATION"
+                    print("[MODE] HUNTING -> EXPLORATION (target lost)")
+            else:
+                self.target_lost_frames = 0
+                return self.interaction_pomdp.update(...)
+```
+
+#### Step 2: Visual Servoing for Approach (Priority: HIGH)
+
+**File:** `pomdp/visual_servoing.py` (new)
+
+Simple proportional control to center target and approach:
+
+```python
+@dataclass
+class ServoingCommand:
+    yaw: int      # Turn to center target horizontally
+    fb: int       # Forward/back to reach target distance
+    ud: int       # Up/down to center target vertically
+
+def compute_servoing(bbox, frame_shape, target_distance_m=2.0):
+    """Compute RC commands to approach and center target."""
+    cx, cy, w, h = bbox  # Normalized 0-1
+
+    # Yaw: center target horizontally
+    x_error = cx - 0.5
+    yaw = int(-x_error * 60)  # P-gain, max ±30
+
+    # Forward/back: approach to target distance
+    # Estimate distance from bbox height (larger = closer)
+    estimated_dist = estimate_distance_from_bbox(h)
+    dist_error = estimated_dist - target_distance_m
+    fb = int(dist_error * 20)  # P-gain, max ±40
+    fb = max(-40, min(40, fb))
+
+    # Vertical: center target (optional, keep level for stability)
+    y_error = cy - 0.5
+    ud = int(-y_error * 20)
+
+    return ServoingCommand(yaw=yaw, fb=fb, ud=ud)
+```
+
+#### Step 3: Integrate Interaction POMDP (Priority: MEDIUM)
+
+**File:** `pomdp/interaction_mode.py` (already exists)
+
+Current implementation has the right structure. Need to:
+
+1. Wire YOLO detection → `encode_yolo_detections()` → `interaction_pomdp.update()`
+2. Map POMDP actions to RC commands
+3. Add interaction behaviors (wiggle, LED)
+
+```python
+# In main loop
+if mode == "HUNTING":
+    obs_token = encode_yolo_detections(yolo_results, ...)
+    result = interaction_pomdp.update(obs_token)
+
+    if result.action == "approach":
+        cmd = compute_servoing(target_bbox, frame.shape)
+        rc = (0, cmd.fb, cmd.ud, cmd.yaw)
+    elif result.action == "interact_wiggle":
+        rc = (0, 0, 0, 15 if frame_count % 20 < 10 else -15)
+    elif result.action == "backoff":
+        rc = (0, -30, 0, 0)
+    # ...
+```
+
+#### Step 4: Human Search POMDP Integration (Priority: MEDIUM)
+
+**File:** `pomdp/human_search.py` (already exists)
+
+Connect to frontier explorer's room tracking:
+
+```python
+# When target detected
+if target_detected:
+    current_room = room_tracker.current_room
+    human_search.update_sighting(current_room, confidence=0.9)
+
+# When searching
+if mode == "EXPLORATION":
+    # Get search recommendation from human POMDP
+    search_target = human_search.get_search_target()
+    if search_target != current_room:
+        # Bias frontier selection toward rooms where humans were seen
+        frontier_explorer.set_preferred_direction(toward=search_target)
+```
+
+#### Step 5: Cat-Specific Behavior (Priority: LOW)
+
+**File:** `cat_safe_shadow.py` (already exists)
+
+Cat shadowing has different rules:
+- Keep greater distance (3-4m)
+- Avoid sudden movements
+- Retreat if person detected (safety)
+- Follow slowly if cat moves
+
+```python
+if target_class == "cat":
+    target_distance = 3.5  # Farther than person
+    max_approach_speed = 20  # Slower
+    if person_also_detected:
+        mode = "RETREAT"  # Safety first
+```
+
+### Testing Plan
+
+#### Test 1: Mode Switching in Simulator
+```bash
+python test_hunting_pipeline.py --test mode_switch
+```
+- Spawn simulated person in room
+- Verify: EXPLORATION → HUNTING transition
+- Remove person, verify: HUNTING → EXPLORATION
+
+#### Test 2: Visual Servoing
+```bash
+python test_hunting_pipeline.py --test servoing
+```
+- Place target at various positions
+- Verify: drone centers and approaches
+- Test: target moves, drone follows
+
+#### Test 3: Full Pipeline
+```bash
+python test_hunting_pipeline.py --test full
+```
+- Start in Kitchen
+- Explore until person found
+- Approach and interact
+- Person leaves, return to exploration
+
+#### Test 4: Real Drone (Ground Test)
+```bash
+python person_hunter_pomdp.py --ground-test
+```
+- Drone on ground (no takeoff)
+- YOLO running on video
+- Verify mode switches and RC commands (logged, not sent)
+
+### Files to Create/Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `pomdp/visual_servoing.py` | CREATE | Proportional control for target approach |
+| `test_hunting_pipeline.py` | CREATE | Integration tests for hunting |
+| `test_full_pipeline.py` | MODIFY | Add mode switching and hunting integration |
+| `person_hunter_pomdp.py` | MODIFY | Use new pipeline architecture |
+
+### Success Criteria
+
+1. **Exploration Phase**: Drone explores 3+ rooms, builds valid occupancy map
+2. **Detection**: YOLO detects person/cat within 1 second of visibility
+3. **Mode Switch**: Transition happens within 3 frames of detection
+4. **Approach**: Drone centers target and reaches 2m distance within 10 seconds
+5. **Interaction**: Drone maintains position, executes wiggle/LED for 5 seconds
+6. **Recovery**: Returns to exploration within 2 seconds of target loss
+
+### Timeline Estimate
+
+| Step | Effort | Dependencies |
+|------|--------|--------------|
+| Mode switching | 2-3 hours | None |
+| Visual servoing | 2-3 hours | Mode switching |
+| Interaction integration | 3-4 hours | Visual servoing |
+| Human search integration | 2-3 hours | Mode switching |
+| Testing and tuning | 4-6 hours | All above |
+| **Total** | **13-19 hours** | |
 
 ---
 

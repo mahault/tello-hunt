@@ -8,7 +8,10 @@
       "Bash(python test_full_pipeline.py:*)",
       "Bash(timeout 60 python:*)",
       "Bash(timeout 120 python:*)",
-      "Bash(timeout 90 python:*)"
+      "Bash(timeout 90 python:*)",
+      "Bash(dir:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)"
     ]
   }
 }
