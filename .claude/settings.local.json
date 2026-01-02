@@ -11,7 +11,10 @@
       "Bash(timeout 90 python:*)",
       "Bash(dir:*)",
       "Bash(ls:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(unzip:*)",
+      "WebFetch(domain:sketchfab.com)",
+      "WebFetch(domain:www.cgtrader.com)"
     ]
   }
 }

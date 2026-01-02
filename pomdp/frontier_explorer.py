@@ -194,6 +194,12 @@ class FrontierExplorer:
         self._blocked_edges: Dict[Tuple[Tuple[int, int], Tuple[int, int]], int] = {}
         self._blocked_edge_ttl = 100  # Frames before edge expires
 
+        # Sighting bias: prioritize exploration toward prior person/cat sighting locations
+        # Set by external code (e.g., HumanSearchPOMDP) to bias frontier selection
+        self._sighting_bias_cell: Optional[Tuple[int, int]] = None
+        self._sighting_bias_strength: float = 2.0  # Distance bonus (meters) at bias cell
+        self._sighting_bias_scale_cells: float = 12  # Falloff scale (grid cells)
+
     # ---------------------------
     # BLOCKED EDGE MANAGEMENT
     # ---------------------------
@@ -379,6 +385,51 @@ class FrontierExplorer:
             if dx <= self._blacklist_radius and dy <= self._blacklist_radius:
                 return True
         return False
+
+    def _diagnose_path(self, grid: np.ndarray, path: List[Tuple[int, int]], n_cells: int = 10) -> Dict:
+        """
+        Diagnose the occupancy along the first n_cells of a path.
+
+        Returns dict with:
+          - obstacle_count: cells with value < 30 (collision-confirmed)
+          - unknown_count: cells with value 100-150 (unexplored)
+          - free_count: cells with value > 200 (known free)
+          - depth_obs_count: cells with value 30-100 (depth-sensed, soft obstacle)
+          - cell_values: list of (cell, value) tuples
+        """
+        if not path:
+            return {"obstacle_count": 0, "unknown_count": 0, "free_count": 0,
+                    "depth_obs_count": 0, "cell_values": []}
+
+        obstacle_count = 0
+        unknown_count = 0
+        free_count = 0
+        depth_obs_count = 0
+        cell_values = []
+
+        for i, (cx, cy) in enumerate(path[:n_cells]):
+            if 0 <= cx < grid.shape[1] and 0 <= cy < grid.shape[0]:
+                val = grid[cy, cx]
+                cell_values.append(((cx, cy), int(val)))
+
+                if val < 30:
+                    obstacle_count += 1
+                elif val < 100:
+                    depth_obs_count += 1  # Depth-sensed soft obstacle
+                elif val < 150:
+                    unknown_count += 1
+                else:
+                    free_count += 1
+
+        return {
+            "obstacle_count": obstacle_count,
+            "unknown_count": unknown_count,
+            "free_count": free_count,
+            "depth_obs_count": depth_obs_count,
+            "cell_values": cell_values,
+            "path_len": len(path),
+            "sampled": min(n_cells, len(path)),
+        }
 
     def _blacklist_target(self, cell: Tuple[int, int]):
         """Add a cell to the blacklist."""
@@ -658,6 +709,16 @@ class FrontierExplorer:
                 effective_dist -= self.doorway_bonus
                 if debug:
                     print(f"  [FRONTIER] Doorway bonus applied to cluster at {cluster.centroid_world}")
+
+            # Apply sighting bias - prioritize frontiers near prior sightings
+            if self._sighting_bias_cell is not None:
+                bx, by = self._sighting_bias_cell
+                cx, cy = cluster.centroid_cell
+                d = math.sqrt((cx - bx)**2 + (cy - by)**2)
+                bonus = self._sighting_bias_strength * math.exp(-d / self._sighting_bias_scale_cells)
+                effective_dist -= bonus
+                if debug and bonus > 0.1:
+                    print(f"  [FRONTIER] Sighting bias {bonus:.2f}m applied to cluster at {cluster.centroid_world}")
 
             if agent_yaw is not None and agent_world is not None:
                 target_heading = math.atan2(
@@ -977,6 +1038,14 @@ class FrontierExplorer:
                         print(f"  [FRONTIER] MID: A* path {len(path)} cells to cluster at "
                               f"({best.centroid_world[0]:.2f}, {best.centroid_world[1]:.2f})")
 
+                    # PATH DIAGNOSTIC: Analyze occupancy along planned path
+                    diag = self._diagnose_path(grid, path, n_cells=10)
+                    if diag["obstacle_count"] > 0 or diag["unknown_count"] > 3:
+                        print(f"  [PATH-DIAG] First 10 cells: {diag['obstacle_count']} obstacle, "
+                              f"{diag['depth_obs_count']} depth-obs, {diag['unknown_count']} unknown, "
+                              f"{diag['free_count']} free")
+                        print(f"  [PATH-DIAG] Values: {diag['cell_values'][:5]}...")
+
         # If we have a planned path, keep updating waypoint as we progress.
         if self._planned_path and self.target is not None:
             # Drop path prefix we've already reached
@@ -1007,12 +1076,22 @@ class FrontierExplorer:
         if abs(heading_error) < self.heading_tolerance:
             # Reset hysteresis when aligned
             self._last_turn = None
-            # Check MULTIPLE points ahead for obstacles
-            check_distances = [0.2, 0.4, 0.6]  # meters
-            for check_dist in check_distances:
-                check_x = agent_x + check_dist * math.cos(agent_yaw)
-                check_y = agent_y + check_dist * math.sin(agent_yaw)
-                check_cell = world_to_map_fn(check_x, check_y)
+
+            # NEW: Check PATH CELLS instead of yaw direction
+            # This prevents getting blocked by collision history not on the actual path
+            if self._planned_path and len(self._planned_path) >= 2:
+                # Check the first 3 cells of the planned path
+                cells_to_check = self._planned_path[1:4]  # Skip agent's own cell
+            else:
+                # Fallback: check ahead by yaw (old behavior)
+                cells_to_check = []
+                check_distances = [0.2, 0.4, 0.6]  # meters
+                for check_dist in check_distances:
+                    check_x = agent_x + check_dist * math.cos(agent_yaw)
+                    check_y = agent_y + check_dist * math.sin(agent_yaw)
+                    cells_to_check.append(world_to_map_fn(check_x, check_y))
+
+            for check_cell in cells_to_check:
 
                 if (0 <= check_cell[0] < grid.shape[1] and
                     0 <= check_cell[1] < grid.shape[0]):
@@ -1023,6 +1102,14 @@ class FrontierExplorer:
                         # Direction is blocked by grid - implement escape behavior
                         self._grid_block_streak += 1
                         print(f"  [FRONTIER] Grid obstacle at dist={check_dist:.1f}m cell={check_cell} val={cell_val} streak={self._grid_block_streak}")
+                        # Enhanced diagnostic: show agent state and path info
+                        print(f"    [COLLISION-DIAG] agent=({agent_x:.2f},{agent_y:.2f}) yaw={math.degrees(agent_yaw):.0f}deg "
+                              f"agent_cell={agent_cell} target={self.target}")
+                        if self._planned_path:
+                            path_diag = self._diagnose_path(grid, self._planned_path, n_cells=5)
+                            print(f"    [COLLISION-DIAG] path ahead: {path_diag['obstacle_count']} obs, "
+                                  f"{path_diag['unknown_count']} unk, {path_diag['free_count']} free "
+                                  f"cells={path_diag['cell_values']}")
 
                         # Record blocked edge so A* will try different approach next time
                         self.record_blocked_edge(agent_cell, check_cell)
@@ -1145,6 +1232,8 @@ class FrontierExplorer:
         self._needs_escape_scan = False
         # Blocked edge memory reset
         self._blocked_edges = {}
+        # Sighting bias reset
+        self._sighting_bias_cell = None
         # Room tracking reset
         self.room_tracker.reset()
 
@@ -1163,6 +1252,33 @@ class FrontierExplorer:
     def get_room_stats(self) -> Dict:
         """Get room transition statistics."""
         return self.room_tracker.get_stats()
+
+    # ---------------------------
+    # SIGHTING BIAS API
+    # ---------------------------
+    def set_sighting_bias(
+        self,
+        cell: Optional[Tuple[int, int]],
+        strength: float = 2.0,
+        scale_cells: float = 12,
+    ) -> None:
+        """
+        Set sighting bias to prioritize frontiers near a prior detection location.
+
+        Call this after a person/cat sighting to bias exploration toward that area.
+
+        Args:
+            cell: Grid cell of sighting (or None to clear bias)
+            strength: Max distance bonus in meters at bias cell
+            scale_cells: Gaussian falloff scale in grid cells
+        """
+        self._sighting_bias_cell = cell
+        self._sighting_bias_strength = strength
+        self._sighting_bias_scale_cells = scale_cells
+
+    def clear_sighting_bias(self) -> None:
+        """Clear sighting bias."""
+        self._sighting_bias_cell = None
 
     # ---------------------------
     # CENTER-OF-GAP BIAS

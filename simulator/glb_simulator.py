@@ -188,12 +188,17 @@ class GLBSimulator:
         floor_y = bounds[0][1]  # Bottom of model (floor level)
         ceiling_y = bounds[1][1]  # Top of model
         room_height = ceiling_y - floor_y
+        self._floor_y = floor_y  # Store for human placement
 
         # Start at 60% of room height (higher to avoid furniture)
         drone_height = floor_y + room_height * 0.6
 
         # Set up rooms first so we can start in a specific room
         self._setup_rooms()
+
+        # Load humans into the scene
+        self._humans = {}  # name -> (node, position)
+        self._load_humans()
 
         # Start in the kitchen (center of kitchen bounds)
         if "Kitchen" in self.rooms:
@@ -257,6 +262,112 @@ class GLBSimulator:
         for name, ((xlo, xhi), (zlo, zhi)) in self.rooms.items():
             print(f"  {name}: x=[{xlo:.0f}, {xhi:.0f}], z=[{zlo:.0f}, {zhi:.0f}]")
         print(f"Vertical bounds: Y=[{y_floor:.0f}, {y_ceiling:.0f}] (floor to ceiling)")
+
+    def _load_humans(self):
+        """
+        Load human models and place them in rooms.
+
+        Currently places "Eric" in the bedroom for testing person detection.
+        """
+        import trimesh
+        import pyrender
+
+        human_glb = Path(__file__).parent / "source" / "HumanModels.glb"
+        if not human_glb.exists():
+            print("No human models found (simulator/source/HumanModels.glb)")
+            return
+
+        print(f"Loading human models from {human_glb}...")
+
+        try:
+            human_scene = trimesh.load(str(human_glb))
+
+            # The model contains multiple humans - extract just one
+            # Pick the first mesh that looks like a full person (most vertices)
+            best_mesh = None
+            best_verts = 0
+            for name, geom in human_scene.geometry.items():
+                if isinstance(geom, trimesh.Trimesh) and len(geom.vertices) > best_verts:
+                    best_mesh = geom
+                    best_verts = len(geom.vertices)
+
+            if best_mesh is None:
+                print("  No suitable mesh found in human model")
+                return
+
+            print(f"  Selected mesh with {best_verts} vertices")
+
+            # Scale: human model is ~6 units tall, house rooms are ~100 units
+            # Scale by 12x to make human ~72 units tall (reasonable for ~1.8m person)
+            scale = 12.0
+            best_mesh.apply_scale(scale)
+
+            # Place Eric in the bedroom
+            if "Bedroom" in self.rooms:
+                (x_min, x_max), (z_min, z_max) = self.rooms["Bedroom"]
+                eric_x = (x_min + x_max) / 2
+                eric_z = (z_min + z_max) / 2
+                eric_y = self._floor_y + 5  # Slightly above floor
+
+                # Apply translation
+                best_mesh.apply_translation([eric_x, eric_y, eric_z])
+
+                # Add to pyrender scene
+                material = pyrender.MetallicRoughnessMaterial(
+                    baseColorFactor=[0.8, 0.6, 0.5, 1.0],  # Skin tone
+                    metallicFactor=0.0,
+                    roughnessFactor=0.8,
+                )
+                mesh = pyrender.Mesh.from_trimesh(best_mesh, material=material)
+                node = self.scene.add(mesh)
+
+                self._humans["Eric"] = {
+                    "node": node,
+                    "position": (eric_x, eric_y, eric_z),
+                    "room": "Bedroom",
+                }
+
+                print(f"  Placed Eric in Bedroom at ({eric_x:.0f}, {eric_y:.0f}, {eric_z:.0f})")
+            else:
+                print("  Bedroom not found, cannot place Eric")
+
+        except Exception as e:
+            print(f"  Error loading human model: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def get_humans_in_view(self) -> list:
+        """
+        Get list of humans currently visible in camera view.
+
+        Returns list of dicts with human info (name, distance, position).
+        """
+        visible = []
+        for name, info in self._humans.items():
+            hx, hy, hz = info["position"]
+
+            # Distance from camera
+            dist = math.sqrt((self.x - hx)**2 + (self.z - hz)**2)
+
+            # Angle to human
+            angle_to_human = math.atan2(hx - self.x, -(hz - self.z))
+            angle_diff = angle_to_human - self.yaw
+            while angle_diff > math.pi:
+                angle_diff -= 2 * math.pi
+            while angle_diff < -math.pi:
+                angle_diff += 2 * math.pi
+
+            # Check if in field of view (~60 degrees = 0.52 rad each side)
+            if abs(angle_diff) < math.radians(self.fov / 2 + 10):  # +10 deg margin
+                visible.append({
+                    "name": name,
+                    "distance": dist,
+                    "position": info["position"],
+                    "room": info["room"],
+                    "angle": math.degrees(angle_diff),
+                })
+
+        return visible
 
     def _check_ray_collision(self, action: int, min_distance: float = 80.0) -> bool:
         """

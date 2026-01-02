@@ -1568,6 +1568,337 @@ python person_hunter_pomdp.py --ground-test
 
 ---
 
+## Phase 16: Map-While-Hunt (Variational Occupancy)
+
+### Current State
+
+We're already halfway to "map-while-hunt": in the current pipeline `SpatialMapper.update(...)` is called every step (it's not gated by mode), so the occupancy grid keeps updating during hunting. The missing piece is: **make the map update explicitly probabilistic + schedule it under a compute budget**, so hunting doesn't starve mapping (and mapping uncertainty can feed back into both pursuit + replanning).
+
+### Architecture: Two-Layer Mapping
+
+Split into two layers:
+
+**1. Fast Planning Map (current)**
+- 2D occupancy grid used by A*/frontier
+- Updated every control tick or at throttled rate
+- Must be stable and cheap
+
+**2. Belief Map (variational/Bayesian)**
+- Maintains uncertainty (not just single uint8 "occupancy value")
+- Produces derived planning grid: `p(occupied)` mean + "unknownness"
+- Enables Active-Inference arbitration: information gain vs pursuit reward
+
+This is the same principle as VBGS: streaming variational updates of a latent map rather than ad-hoc threshold painting. VBGS does this for Gaussian splats; we do it first for occupancy because it's trivial and extremely effective (classic probabilistic robotics).
+
+### Why It Matters for Hunting
+
+When approaching a person/cat, we still:
+- Refine free space ahead (reduces "doorway hallucinations" reappearing)
+- Keep room-transition evidence current
+- Keep frontiers fresh so target-loss recovery is instantaneous
+
+### Implementation: Beta-Bernoulli Belief Map
+
+Current `OccupancyMap` is a uint8 grid with increment/decrement heuristics. It works, but it's not a clean Bayesian object.
+
+**Recommended representation: Beta-Bernoulli per cell**
+
+For each cell `c`:
+- Occupancy is Bernoulli with parameter `p_c`
+- Prior/posterior over `p_c` is `Beta(α_c, β_c)`
+- Update with "evidence" increments (soft counts) from:
+  - Depth obstacle hits (weak, noisy)
+  - Free-space ray traversal (weak-to-moderate)
+  - Collision-confirmed obstacles (very strong)
+
+Then:
+- Posterior mean: `E[p_c] = α_c / (α_c + β_c)`
+- Uncertainty: `Var(p_c)` tells you what's still ambiguous
+
+**Implementation in `utils/occupancy_map.py`:**
+
+```python
+@dataclass
+class BeliefOccupancyMap:
+    alpha: np.ndarray  # float32[H,W] - occupied evidence
+    beta: np.ndarray   # float32[H,W] - free evidence
+    locked: np.ndarray # bool[H,W] - collision-confirmed cells
+
+    def __init__(self, width: int, height: int, prior_alpha: float = 1.0, prior_beta: float = 1.0):
+        self.alpha = np.full((height, width), prior_alpha, dtype=np.float32)
+        self.beta = np.full((height, width), prior_beta, dtype=np.float32)
+        self.locked = np.zeros((height, width), dtype=bool)
+
+    def update_free(self, x: int, y: int, weight: float = 1.0):
+        """Ray passed through this cell - evidence it's free."""
+        if not self.locked[y, x]:
+            self.beta[y, x] += weight
+
+    def update_occupied(self, x: int, y: int, weight: float = 1.0):
+        """Depth sensed obstacle here - weak evidence it's occupied."""
+        if not self.locked[y, x]:
+            self.alpha[y, x] += weight
+
+    def lock_collision(self, x: int, y: int):
+        """Collision confirmed - very strong evidence, lock cell."""
+        self.alpha[y, x] += 100.0  # Strong evidence
+        self.locked[y, x] = True
+
+    @property
+    def p_occupied(self) -> np.ndarray:
+        """Posterior mean P(occupied)."""
+        return self.alpha / (self.alpha + self.beta)
+
+    @property
+    def entropy(self) -> np.ndarray:
+        """Entropy of Beta distribution (uncertainty)."""
+        from scipy.stats import beta as beta_dist
+        # Approximate: high when alpha ≈ beta, low when one dominates
+        total = self.alpha + self.beta
+        p = self.alpha / total
+        return -p * np.log(p + 1e-10) - (1-p) * np.log(1-p + 1e-10)
+
+    def to_costmap(self, lambda_occ: float = 10.0, lambda_uncert: float = 2.0) -> np.ndarray:
+        """Generate A* costmap from belief."""
+        p_occ = self.p_occupied
+        ent = self.entropy
+        # Base cost + occupancy penalty + uncertainty penalty (for exploration)
+        cost = 1.0 + lambda_occ * p_occ + lambda_uncert * ent
+        # Blocked if p_occ > threshold
+        cost[p_occ > 0.7] = np.inf
+        return cost
+```
+
+### Scheduling: Hunt Without Starving Mapping
+
+During HUNT/APPROACH:
+- Run depth-ray updates at lower rate (e.g., 5 Hz) or reduce rays from 60 → 20
+- Always apply collision-confirmed updates immediately
+
+```python
+class MappingScheduler:
+    def __init__(self, full_rate_hz: float = 30.0, hunt_rate_hz: float = 5.0):
+        self.full_rate_hz = full_rate_hz
+        self.hunt_rate_hz = hunt_rate_hz
+        self.last_update = 0.0
+
+    def should_update(self, mode: str, current_time: float) -> bool:
+        rate = self.hunt_rate_hz if mode == "HUNTING" else self.full_rate_hz
+        interval = 1.0 / rate
+        if current_time - self.last_update >= interval:
+            self.last_update = current_time
+            return True
+        return False
+
+    def get_ray_count(self, mode: str) -> int:
+        return 20 if mode == "HUNTING" else 60
+```
+
+### Behavior Arbitration: Chase + Map + Safe Navigation
+
+Keep discrete mode machine but make action selection in HUNT/APPROACH a weighted blend:
+
+**Action Sources:**
+1. Visual servoing controller (centering + approach)
+2. Local obstacle avoidance (already exists)
+3. Global planner / frontier / "reacquire" planner (when target lost/occluded)
+
+**Arbitration Rule (simple, robust):**
+
+Compute target confidence score each tick:
+- Based on YOLO confidence + bounding-box area stability + time-since-last-seen
+
+Then:
+- **High confidence**: Prioritize servoing, but clamp velocity/turn-rate using occupancy belief (don't push into unknown aggressively)
+- **Medium confidence**: Servoing + cautious replanning (small moves, keep target in frame)
+- **Low confidence**: Switch to reacquire (biased frontier search), mapping continues
+
+This makes "keep mapping while hunting" automatic: **mapping is never a mode, it's a service**.
+
+```python
+def compute_target_confidence(yolo_conf: float, bbox_area: float, frames_since_seen: int) -> float:
+    """Compute confidence score for arbitration."""
+    base = yolo_conf
+    # Larger bbox = closer = more confident
+    area_factor = min(1.0, bbox_area / 0.3)  # Saturate at 30% of frame
+    # Decay with time since last seen
+    time_decay = 0.9 ** frames_since_seen
+    return base * area_factor * time_decay
+
+def arbitrate_action(confidence: float, servo_cmd, avoid_cmd, replan_cmd):
+    """Blend actions based on confidence."""
+    if confidence > 0.7:
+        # High confidence: mostly servoing, some avoidance
+        return blend(servo_cmd, avoid_cmd, weights=[0.8, 0.2])
+    elif confidence > 0.3:
+        # Medium: cautious blend
+        return blend(servo_cmd, avoid_cmd, replan_cmd, weights=[0.5, 0.3, 0.2])
+    else:
+        # Low: reacquire mode
+        return blend(replan_cmd, avoid_cmd, weights=[0.7, 0.3])
+```
+
+### A* Integration with Belief Map
+
+A* should treat cells as blocked if `p_occ > τ_block` (e.g., 0.7), but also add soft cost for `p_occ` so it prefers safer corridors.
+
+In exploration, add term that prefers high-entropy frontiers (information gain):
+
+```python
+def astar_cost(cell, belief_map, mode):
+    p_occ = belief_map.p_occupied[cell]
+    ent = belief_map.entropy[cell]
+
+    if p_occ > 0.7:
+        return float('inf')  # Blocked
+
+    base_cost = 1.0
+    occ_cost = 5.0 * p_occ  # Prefer lower occupancy probability
+
+    if mode == "EXPLORATION":
+        # Prefer high-entropy cells (information gain)
+        info_bonus = -2.0 * ent
+    else:
+        # During hunting, avoid uncertainty
+        info_bonus = 1.0 * ent
+
+    return base_cost + occ_cost + info_bonus
+```
+
+### Reacquire Bias for Frontier Explorer
+
+When target is lost:
+1. Define "sighting prior" over map (last-seen position + decay + room-transition likelihood)
+2. Frontier scoring becomes: `score = frontier_gain + λ * sighting_prior(frontier)`
+
+This is the Human Search POMDP influencing exploration:
+
+```python
+def compute_sighting_prior(position, last_seen_pos, last_seen_time, room_tracker):
+    """Prior probability target is near this position."""
+    # Distance decay from last sighting
+    dist = np.linalg.norm(np.array(position) - np.array(last_seen_pos))
+    dist_factor = np.exp(-dist / 2.0)  # 2m decay constant
+
+    # Time decay
+    time_factor = 0.95 ** (current_time - last_seen_time)
+
+    # Room transition factor (target more likely in connected rooms)
+    room_factor = 1.0
+    if room_tracker.current_room != last_seen_room:
+        if rooms_are_adjacent(room_tracker.current_room, last_seen_room):
+            room_factor = 0.7
+        else:
+            room_factor = 0.3
+
+    return dist_factor * time_factor * room_factor
+```
+
+### Where VBGS Fits (Realistic Phasing)
+
+VBGS (Variational Bayes Gaussian Splatting) is specifically about continual scene learning as variational inference over Gaussian splat parameters, avoiding catastrophic forgetting in streaming settings.
+
+**Practical constraint for Tello:**
+- Need reasonably stable camera poses (VO/SLAM quality)
+- Multi-view integration (RGB, ideally depth or stereo)
+- GPU budget
+
+**Phased approach:**
+
+| Phase | Description | Benefit |
+|-------|-------------|---------|
+| **A (now)** | Variational occupancy belief grid (Beta map) | Immediate doorway robustness + chase safety |
+| **B (sim-first)** | VBGS as auxiliary world model in GLB sim | Stress-test map-while-hunt at richer fidelity |
+| **C (optional)** | Real-drone VBGS offboard | Run on laptop GPU, stream frames + poses |
+
+### Concrete Implementation Steps
+
+| Step | Description | Files |
+|------|-------------|-------|
+| 0 | Confirm mapping runs in hunting (it does) | - |
+| 1 | Add `BeliefOccupancyMap` with alpha/beta arrays | `utils/occupancy_map.py` |
+| 2 | Replace `_update_cell()` with Bayesian weight updates | `utils/occupancy_map.py` |
+| 3 | Feed belief map into A* with soft costs | `pomdp/frontier_explorer.py` |
+| 4 | Throttle mapping compute during HUNT | `test_full_pipeline.py` |
+| 5 | Add reacquire bias to frontier explorer | `pomdp/frontier_explorer.py` |
+
+---
+
+## Phase 17: Persistent Explore-Then-Hunt Runner ✓ IMPLEMENTED
+
+### Overview
+
+A drop-in script that enables persistent mapping across sessions without refactoring the pipeline.
+
+**File:** `run_persistent_explore_then_hunt.py`
+
+### What It Does
+
+1. Creates a `FullPipelineSimulator(--frontier)`
+2. Loads saved map + odometry if it exists
+3. Runs EXPLORATION for N frames (or until progress in unknown space)
+4. Saves state
+5. Switches to HUNTING for M frames
+6. Saves state again
+
+On subsequent runs, it resumes from the saved map and does a short "top-up exploration" focused on frontiers adjacent to unknown, then hunts again.
+
+### Usage
+
+```bash
+# First run (no saved state yet)
+python run_persistent_explore_then_hunt.py --frontier --explore_frames 800 --hunt_frames 800
+
+# Subsequent runs (auto-loads state)
+python run_persistent_explore_then_hunt.py --frontier --resume_explore_frames 250 --hunt_frames 800
+
+# Stop hunting early when target detected
+python run_persistent_explore_then_hunt.py --stop_on_detect
+```
+
+### What Gets Persisted
+
+| Data | Purpose |
+|------|---------|
+| `grid` | Occupancy values |
+| `visit_count` | Confidence per cell |
+| `trajectory` | Path history |
+| `places` / `place_labels` | Named locations |
+| `pose_x/y/yaw` | Odometry state |
+| `room_*` | Room transition tracker state |
+
+### Benefits
+
+- **Persistent occupancy map** across sessions
+- **Top-up exploration** on resume picks new frontiers (based on unknown adjacency)
+- **Map updates during hunting** (mapper update always runs in main loop)
+- **Early stopping** when unknown% drops or target detected
+
+### Recommended Next Upgrades
+
+#### 1. Persist Blocked-Edge Memory and Frontier Blacklist
+
+So it doesn't re-try the same failure approach after restart.
+
+```python
+# Add to save_pipeline_state:
+"blocked_edges": np.array(list(pipeline.frontier_explorer._blocked_edges.items()), dtype=object),
+"blocked_targets": np.array(pipeline.frontier_explorer._blocked_targets, dtype=object),
+```
+
+#### 2. Persist Sighting Prior (Human Search POMDP)
+
+On resume, exploration is biased toward rooms/corridors where targets were last seen.
+
+```python
+# Add to save_pipeline_state:
+"sighting_counts": human_search.sighting_counts,
+"last_seen_room": human_search.last_seen_room,
+"last_seen_time": human_search.last_seen_time,
+```
+
+---
+
 ## Research References
 
 - [Bio-Inspired Topological Autonomous Navigation with Active Inference](https://arxiv.org/html/2508.07267) - Ghent University / VERSES. Core approach for incremental topological mapping, localization via observation matching, EFE-guided exploration.
